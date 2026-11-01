@@ -25,6 +25,21 @@ export function formatHuman(date: Date): string {
   return DateTime.fromJSDate(date).setZone(TIMEZONE).toFormat("ccc d LLL, HH:mm");
 }
 
+/** Date -> "Mon 2 Nov (tomorrow)" so it's obvious which day is meant. */
+export function formatDay(date: Date): string {
+  const day = DateTime.fromJSDate(date).setZone(TIMEZONE);
+  return `${day.toFormat("ccc d LLL")} (${relativeDay(day)})`;
+}
+
+/** "today", "tomorrow", "yesterday", "in 3 days", "2 days ago" — in salon time. */
+export function relativeDay(day: DateTime): string {
+  const diff = Math.round(day.startOf("day").diff(now().startOf("day"), "days").days);
+  if (diff === 0) return "today";
+  if (diff === 1) return "tomorrow";
+  if (diff === -1) return "yesterday";
+  return diff > 0 ? `in ${diff} days` : `${-diff} days ago`;
+}
+
 export function formatTime(date: Date): string {
   return DateTime.fromJSDate(date).setZone(TIMEZONE).toFormat("HH:mm");
 }

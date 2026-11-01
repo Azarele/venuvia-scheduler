@@ -2,6 +2,8 @@
 // produce a preview, and run after the user clicks Approve (see agent.ts).
 import {
   BookingError,
+  cancelBooking,
+  checkCancel,
   checkCreate,
   checkUpdate,
   createBooking,
@@ -10,7 +12,7 @@ import {
   getClients,
   updateBooking,
 } from "../bookings.ts";
-import { formatLocal } from "../time.ts";
+import { formatDay, formatLocal, parseLocal } from "../time.ts";
 
 export type ToolDef = {
   name: string;
@@ -26,12 +28,13 @@ export const TOOLS: ToolDef[] = [
     name: "get_bookings",
     kind: "read",
     description:
-      "List the current user's bookings (with ids), ordered by time. Optionally filter by date and/or client name. Call this before updating a booking to find its id.",
+      "List the current user's bookings (with ids), ordered by time. Optionally filter by date and/or client name. Cancelled bookings are left out unless include_cancelled is true. Call this before updating or cancelling a booking to find its id.",
     parameters: {
       type: "object",
       properties: {
         date: { type: "string", description: 'Only bookings on this local date, "YYYY-MM-DD".' },
         client_name: { type: "string", description: "Only bookings for this client." },
+        include_cancelled: { type: "boolean", description: "Also list cancelled bookings." },
       },
     },
   },
@@ -74,6 +77,19 @@ export const TOOLS: ToolDef[] = [
       required: ["booking_id"],
     },
   },
+  {
+    name: "cancel_booking",
+    kind: "write",
+    description:
+      "Cancel an existing booking. The booking is kept in history as cancelled and its time slot becomes free. Needs the user's approval in the app before it happens.",
+    parameters: {
+      type: "object",
+      properties: {
+        booking_id: { type: "integer", description: "Id from get_bookings." },
+      },
+      required: ["booking_id"],
+    },
+  },
 ];
 
 export const findTool = (name: string) => TOOLS.find((t) => t.name === name);
@@ -86,9 +102,18 @@ export async function runReadTool(name: string, args: Args, ctx: Ctx): Promise<u
     const bookings = await getBookings(ctx.userId, {
       date: typeof args.date === "string" && args.date ? args.date : undefined,
       clientName: typeof args.client_name === "string" && args.client_name ? args.client_name : undefined,
+      includeCancelled: args.include_cancelled === true,
     });
     return {
-      bookings: bookings.map(({ id, clientName, service, start, end }) => ({ id, client: clientName, service, start, end })),
+      bookings: bookings.map(({ id, clientName, service, start, end, status }) => ({
+        id,
+        client: clientName,
+        service,
+        start,
+        end,
+        day: formatDay(parseLocal(start)!.toJSDate()), // e.g. "Mon 2 Nov (tomorrow)"
+        status,
+      })),
     };
   }
   if (name === "get_clients") {
@@ -107,6 +132,10 @@ export async function previewWriteTool(name: string, args: Args, ctx: Ctx): Prom
     const c = await checkUpdate(updateInput(args, ctx));
     const after = { clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) };
     return `Change booking #${c.bookingId}: ${describeBooking(c.before)}  →  ${describeBooking(after)}`;
+  }
+  if (name === "cancel_booking") {
+    const booking = await checkCancel({ userId: ctx.userId, bookingId: args.booking_id });
+    return `Cancel booking #${booking.id}: ${describeBooking(booking)}`;
   }
   throw new BookingError(`Unknown tool ${name}.`);
 }
@@ -127,6 +156,14 @@ export async function runWriteTool(name: string, args: Args, ctx: Ctx): Promise<
       result: { ok: true, booking: after },
       message: `Done — booking #${after.id} is now ${describeBooking(after)}.`,
       bookingId: after.id,
+    };
+  }
+  if (name === "cancel_booking") {
+    const booking = await cancelBooking({ userId: ctx.userId, bookingId: args.booking_id });
+    return {
+      result: { ok: true, booking },
+      message: `Done — cancelled booking #${booking.id} (${describeBooking(booking)}). The time slot is free again.`,
+      bookingId: booking.id,
     };
   }
   throw new BookingError(`Unknown tool ${name}.`);

@@ -3,7 +3,7 @@
 // message the AI can relay to the user.
 import type pg from "pg";
 import { pool } from "./db.ts";
-import { formatHuman, formatLocal, formatTime, now, parseLocal } from "./time.ts";
+import { formatDay, formatLocal, formatTime, now, parseLocal } from "./time.ts";
 
 export class BookingError extends Error {}
 
@@ -18,6 +18,7 @@ export type Booking = {
   service: string | null;
   start: string; // local "YYYY-MM-DD HH:mm"
   end: string;
+  status: "confirmed" | "cancelled";
 };
 
 export type Client = {
@@ -36,11 +37,12 @@ type BookingRow = {
   service: string | null;
   start_at: Date;
   end_at: Date;
+  status: "confirmed" | "cancelled";
 };
 
 const SELECT_BOOKINGS = `
   select b.id, b.user_id, u.name as user_name, b.client_id, c.name as client_name,
-         b.service, b.start_at, b.end_at
+         b.service, b.start_at, b.end_at, b.status
   from bookings b
   join users u on u.id = b.user_id
   join clients c on c.id = b.client_id`;
@@ -57,6 +59,7 @@ function toBooking(row: BookingRow): Booking {
     service: row.service,
     start: formatLocal(row.start_at),
     end: formatLocal(row.end_at),
+    status: row.status,
   };
 }
 
@@ -72,12 +75,13 @@ export async function getUser(id: number): Promise<User | null> {
   return rows[0] ?? null;
 }
 
-/** A user's bookings, optionally filtered to one local date and/or a client name. */
+/** A user's bookings, optionally filtered to one local date and/or a client name. Cancelled ones are left out unless asked for. */
 export async function getBookings(
   userId: number,
-  filters: { date?: string; clientName?: string } = {},
+  filters: { date?: string; clientName?: string; includeCancelled?: boolean } = {},
 ): Promise<Booking[]> {
   const where = ["b.user_id = $1"];
+  if (!filters.includeCancelled) where.push("b.status = 'confirmed'");
   const params: unknown[] = [userId];
   if (filters.date) {
     const day = parseLocal(filters.date);
@@ -106,7 +110,7 @@ export async function getClients(): Promise<Client[]> {
     `select c.id, c.name, count(b.id) as booking_count,
             min(b.start_at) filter (where b.start_at > now()) as next_booking
      from clients c
-     left join bookings b on b.client_id = c.id
+     left join bookings b on b.client_id = c.id and b.status = 'confirmed'
      group by c.id
      order by c.name`,
   );
@@ -122,6 +126,7 @@ export async function getClients(): Promise<Client[]> {
 
 export type CreateInput = { userId: number; clientName: unknown; start: unknown; end?: unknown; service?: unknown };
 export type UpdateInput = { userId: number; bookingId: unknown; start?: unknown; end?: unknown; clientName?: unknown; service?: unknown };
+export type CancelInput = { userId: number; bookingId: unknown };
 
 type CheckedCreate = { userId: number; clientName: string; start: Date; end: Date; service: string | null };
 type CheckedUpdate = CheckedCreate & { bookingId: number; before: Booking };
@@ -136,10 +141,9 @@ export async function checkCreate(input: CreateInput): Promise<CheckedCreate> {
 
 /** Validates an update request without writing anything. Omitted fields keep their current value. */
 export async function checkUpdate(input: UpdateInput): Promise<CheckedUpdate> {
-  const bookingId = Number(input.bookingId);
-  const before = Number.isInteger(bookingId) ? await getBooking(bookingId) : null;
-  if (!before || before.userId !== input.userId)
-    throw new BookingError(`Booking #${input.bookingId} doesn't exist for this user. Use get_bookings to find the right id.`);
+  const before = await findOwnBooking(input.userId, input.bookingId);
+  const bookingId = before.id;
+  if (before.status === "cancelled") throw new BookingError(`Booking #${bookingId} is cancelled, so it can't be changed. Create a new booking instead.`);
 
   const oldStart = parseLocal(before.start)!;
   const oldMinutes = parseLocal(before.end)!.diff(oldStart, "minutes").minutes;
@@ -205,7 +209,34 @@ export async function updateBooking(input: UpdateInput): Promise<{ before: Booki
   }
 }
 
+/** Validates a cancel request without writing anything. */
+export async function checkCancel(input: CancelInput): Promise<Booking> {
+  const booking = await findOwnBooking(input.userId, input.bookingId);
+  if (booking.status === "cancelled") throw new BookingError(`Booking #${booking.id} is already cancelled.`);
+  if (parseLocal(booking.end)! <= now()) throw new BookingError(`Booking #${booking.id} has already happened, so it can't be cancelled.`);
+  return booking;
+}
+
+/** Marks a booking as cancelled. The row is kept for history; the time slot becomes free. */
+export async function cancelBooking(input: CancelInput): Promise<Booking> {
+  const booking = await checkCancel(input); // re-checked at execution time
+  await pool.query(
+    `update bookings set status = 'cancelled', cancelled_at = now(), updated_at = now()
+     where id = $1 and status = 'confirmed'`,
+    [booking.id],
+  );
+  return (await getBooking(booking.id))!;
+}
+
 // ---------- Simple checks ----------
+
+async function findOwnBooking(userId: number, bookingId: unknown): Promise<Booking> {
+  const id = Number(bookingId);
+  const booking = Number.isInteger(id) ? await getBooking(id) : null;
+  if (!booking || booking.userId !== userId)
+    throw new BookingError(`Booking #${bookingId} doesn't exist for this user. Use get_bookings to find the right id.`);
+  return booking;
+}
 
 function cleanName(value: unknown): string {
   const name = typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
@@ -232,7 +263,7 @@ function checkTimes(startValue: unknown, endValue: unknown, defaultMinutes: numb
 async function checkNoOverlap(userId: number, start: Date, end: Date, ignoreBookingId?: number) {
   const { rows } = await pool.query<BookingRow>(
     `${SELECT_BOOKINGS}
-     where b.user_id = $1 and b.start_at < $3 and b.end_at > $2 and b.id <> $4
+     where b.user_id = $1 and b.status = 'confirmed' and b.start_at < $3 and b.end_at > $2 and b.id <> $4
      order by b.start_at`,
     [userId, start, end, ignoreBookingId ?? -1],
   );
@@ -257,6 +288,6 @@ async function findOrCreateClient(db: pg.PoolClient, name: string): Promise<numb
 export function describeBooking(b: { clientName: string; start: string; end: string; service?: string | null }): string {
   const start = parseLocal(b.start)!.toJSDate();
   const end = parseLocal(b.end)!.toJSDate();
-  return `${b.clientName}${b.service ? ` (${b.service})` : ""}, ${formatHuman(start)}–${formatTime(end)}`;
+  return `${b.clientName}${b.service ? ` (${b.service})` : ""}, ${formatDay(start)}, ${formatTime(start)}–${formatTime(end)}`;
 }
 

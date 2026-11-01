@@ -5,7 +5,7 @@ import { getBookings } from "@/lib/bookings.ts";
 export async function GET(request: Request) {
   try {
     const userId = Number(new URL(request.url).searchParams.get("userId"));
-    return Response.json({ bookings: await getBookings(userId) });
+    return Response.json({ bookings: await getBookings(userId, { includeCancelled: true }) });
   } catch (error) {
     return errorResponse(error);
   }

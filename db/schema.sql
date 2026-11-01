@@ -27,6 +27,9 @@ create table bookings (
   service    text,
   start_at   timestamptz not null,
   end_at     timestamptz not null,
+  -- Cancelled bookings are kept (for history) but no longer block the time slot.
+  status       text not null default 'confirmed' check (status in ('confirmed', 'cancelled')),
+  cancelled_at timestamptz,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint bookings_end_after_start check (end_at > start_at)

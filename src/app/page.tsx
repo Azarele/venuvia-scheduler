@@ -15,7 +15,7 @@ type Bubble = {
   done?: boolean;
 };
 
-const EXAMPLES = ["Create a booking for 2pm tomorrow under a random name", "Change it to 4pm", "Get all bookings"];
+const EXAMPLES = ["Create a booking for 2pm tomorrow under a random name", "Change it to 4pm", "Get all bookings", "Cancel Julia's booking"];
 
 async function post<T>(url: string, body: unknown): Promise<T> {
   const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -174,8 +174,12 @@ export default function Home() {
                     <div className="approval-summary">{b.pending.summary}</div>
                     {!b.decision && (
                       <div className="approval-actions">
-                        <button className="primary" disabled={busy} onClick={() => decide(b.pending!, true)}>
-                          Approve
+                        <button
+                          className={b.pending.tool === "cancel_booking" ? "danger" : "primary"}
+                          disabled={busy}
+                          onClick={() => decide(b.pending!, true)}
+                        >
+                          {b.pending.tool === "cancel_booking" ? "Approve cancellation" : "Approve"}
                         </button>
                         <button disabled={busy} onClick={() => decide(b.pending!, false)}>
                           Reject
@@ -220,7 +224,7 @@ export default function Home() {
         <aside className="side">
           <section className="panel">
             <h2>
-              Bookings <span className="muted">· {user?.name ?? "…"}</span>
+              Bookings <span className="muted">· {user?.name ?? "…"} · {bookings.filter((b) => b.status === "confirmed").length} active</span>
             </h2>
             {bookings.length === 0 ? (
               <p className="empty">No bookings yet.</p>
@@ -237,14 +241,19 @@ export default function Home() {
                 </thead>
                 <tbody>
                   {bookings.map((b) => (
-                    <tr key={`${b.id}-${b.start}`} className={b.id === highlight ? "highlight" : ""}>
+                    <tr
+                      key={`${b.id}-${b.start}-${b.status}`}
+                      className={[b.id === highlight ? "highlight" : "", b.status === "cancelled" ? "cancelled" : ""].join(" ")}
+                    >
                       <td className="muted">{b.id}</td>
                       <td>{b.clientName}</td>
                       <td>{b.start.slice(0, 10)}</td>
                       <td>
                         {b.start.slice(11)}–{b.end.slice(11)}
                       </td>
-                      <td className="muted">{b.service ?? "—"}</td>
+                      <td className="muted">
+                        {b.status === "cancelled" ? <span className="tag">cancelled</span> : (b.service ?? "—")}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

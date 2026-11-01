@@ -78,6 +78,7 @@ button:disabled { cursor: default; opacity: 0.55; }
 .approval-actions { display: flex; gap: 8px; margin-top: 10px; }
 .approval-actions button { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: #fff; }
 .approval-actions .primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.approval-actions .danger { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 .examples { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 18px 10px; }
 .examples button { font-size: 13px; border: 1px solid var(--line); background: var(--panel); color: var(--muted); border-radius: 999px; padding: 5px 11px; }
@@ -95,6 +96,9 @@ th:first-child, td:first-child { padding-left: 18px; width: 40px; }
 th { font-size: 12px; color: var(--muted); font-weight: 600; }
 tbody tr:last-child td { padding-bottom: 12px; }
 tr.highlight td { background: var(--ok); }
+tr.cancelled td { color: var(--muted); }
+tr.cancelled td:nth-child(2), tr.cancelled td:nth-child(4) { text-decoration: line-through; }
+.tag { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; padding: 2px 6px; border-radius: 5px; background: #fdecef; color: var(--danger); }
 .empty { color: var(--muted); padding: 0 18px 14px; margin: 0; }
 
 @media (max-width: 860px) {

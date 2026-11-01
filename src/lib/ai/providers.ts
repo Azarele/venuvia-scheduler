@@ -195,10 +195,16 @@ function scripted(): Provider {
       const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content.toLowerCase() ?? "";
       const last = messages[messages.length - 1];
       const wantsChange = /\b(change|move|reschedule|update)\b/.test(lastUser);
+      const wantsCancel = /\bcancel\b/.test(lastUser);
 
       if (last.role === "tool") {
         const data = JSON.parse(last.content);
         if (data.error) return say(`I couldn't do that: ${data.error}`);
+        if (data.bookings && wantsCancel && data.bookings.length) {
+          const named = data.bookings.find((b: { client: string }) => lastUser.includes(b.client.toLowerCase()));
+          const target = named ?? data.bookings.reduce((a: { id: number }, b: { id: number }) => (b.id > a.id ? b : a));
+          return call("cancel_booking", { booking_id: target.id });
+        }
         if (data.bookings && wantsChange && data.bookings.length) {
           const target = data.bookings.reduce((a: { id: number }, b: { id: number }) => (b.id > a.id ? b : a));
           const time = hourIn(lastUser.split(/\bto\b/).pop() ?? "");
@@ -213,14 +219,14 @@ function scripted(): Provider {
         return say("Done.");
       }
 
-      if (wantsChange) return call("get_bookings", {});
+      if (wantsChange || wantsCancel) return call("get_bookings", {});
       if (/\b(book|create|add|make)\b/.test(lastUser)) {
         const time = hourIn(lastUser);
         if (!time) return say("What time should the booking be?");
         return call("create_booking", { client_name: NAMES[Math.floor(Math.random() * NAMES.length)], start: `${tomorrow()} ${time}` });
       }
       if (/\b(show|get|list|all|bookings)\b/.test(lastUser)) return call("get_bookings", {});
-      return say("(Scripted demo) Try: “Create a booking for 2pm tomorrow under a random name”, “Change it to 4pm”, or “Get all bookings”.");
+      return say("(Scripted demo) Try: “Create a booking for 2pm tomorrow under a random name”, “Change it to 4pm”, “Get all bookings”, or “Cancel Julia's booking”.");
     },
   };
 }

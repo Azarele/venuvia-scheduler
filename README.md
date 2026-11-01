@@ -1,6 +1,6 @@
 # Studio Nova: AI Booking Assistant
 
-A single-page Next.js app where a salon user chats with an AI assistant that **reads and changes bookings in a local Postgres database**. The AI does its work through function calls (`get_bookings`, `create_booking`, `update_booking`, `get_clients`), and **every change waits for the user to click Approve** before anything is written. A side panel shows live bookings and clients.
+A single-page Next.js app where a salon user chats with an AI assistant that **reads and changes bookings in a local Postgres database**. The AI does its work through function calls (`get_bookings`, `get_clients`, `create_booking`, `update_booking`, `cancel_booking`), and **every change waits for the user to click Approve** before anything is written. A side panel shows live bookings and clients.
 
 ![Approval flow](docs/screenshots/3-change-approval.png)
 
@@ -8,6 +8,7 @@ The demo script, which is the core flow:
 1. *"Create a booking for 2pm tomorrow under a random name"* → approval card → **Approve** → the row appears
 2. *"Change it to 4pm"* → the AI calls `get_bookings` to find it, then `update_booking` → **Approve** → the row moves
 3. *"Get all bookings"* → the AI lists them
+4. *"Cancel Julia's booking"* → lookup, then `cancel_booking` → red **Approve cancellation** → the row stays in the panel, struck through and marked cancelled
 
 Screenshots of each step are in [`docs/screenshots/`](docs/screenshots).
 
@@ -61,6 +62,8 @@ npm run dev
 ```
 Open **http://localhost:3000**. The badge at the top right shows which AI is active. If the key is missing, a banner explains what to set.
 
+> **"Tomorrow" means tomorrow in salon time** (`Europe/Warsaw` by default). If you test from another timezone late in the evening, the salon may already be on the next day. Set `BUSINESS_TIMEZONE` in `.env.local` (e.g. `Europe/London`) to match your clock. Approval cards always show the relative day, e.g. `Tue 3 Nov (tomorrow)`, so a wrong day is easy to spot before approving.
+
 ---
 
 ## How it works
@@ -86,7 +89,7 @@ Open **http://localhost:3000**. The badge at the top right shows which AI is act
 - **The AI never touches the database.** It can only ask for a tool call. Our code decides what runs.
 - **Reads run straight away** (`get_bookings`, `get_clients`), and the result goes back to the AI so it can continue. That's how *"change it to 4pm"* works: it looks the booking up, then proposes the update.
 - **Writes pause for approval.** The server checks the request, stores it as a pending action (server-side, so the browser can only approve or reject by id and can't alter what runs) and shows a summary card that our code generates, not the AI. On **Approve** the checks run again in case anything changed meanwhile, then the SQL runs inside a transaction. On **Reject** nothing is written. Either way, the outcome goes back into the conversation so the AI knows what happened.
-- **Simple checks:** valid time format, end after start, not in the past, max 12 hours, the booking belongs to this user, and no overlap with the user's other bookings. Failures are returned to the AI as errors, and it explains them to the user.
+- **Simple checks:** valid time format, end after start, not in the past, max 12 hours, the booking belongs to this user, no overlap with the user's other confirmed bookings, cancelled bookings can't be changed or cancelled twice, and past bookings can't be cancelled. Failures are returned to the AI as errors, and it explains them to the user.
 - **Dates:** the AI and UI use local salon time (`"2026-11-02 14:00"`, Europe/Warsaw). Postgres stores real `timestamptz` values, and conversion happens in one place (`src/lib/time.ts`).
 
 ### Database schema: why a separate `clients` table
@@ -94,10 +97,13 @@ Open **http://localhost:3000**. The badge at the top right shows which AI is act
 ```sql
 users    (id, name)                                      -- who owns bookings (owner / staff)
 clients  (id, name unique case-insensitive, created_at)  -- the salon's customers
-bookings (id, user_id → users, client_id → clients, service, start_at, end_at, created_at, updated_at)
+bookings (id, user_id → users, client_id → clients, service, start_at, end_at,
+          status 'confirmed' | 'cancelled', cancelled_at, created_at, updated_at)
 ```
 
-Clients get their own table instead of a name column on each booking. One client books many times. With a copied name, a typo ("Ana" vs "Anna") splits one person into two, and a later phone or email column would have nowhere to live. All bookings live in **one** table that references both the user and the client, so nothing is stored twice. `create_booking` finds the client by name (case-insensitive) or creates them in the same transaction. See [`db/schema.sql`](db/schema.sql).
+Clients get their own table instead of a name column on each booking. One client books many times. With a copied name, a typo ("Ana" vs "Anna") splits one person into two, and a later phone or email column would have nowhere to live. All bookings live in **one** table that references both the user and the client, so nothing is stored twice. `create_booking` finds the client by name (case-insensitive) or creates them in the same transaction.
+
+Cancelling sets `status = 'cancelled'` instead of deleting the row. The history stays (who cancelled what, and when), while cancelled bookings no longer block the slot or count in the Clients panel. See [`db/schema.sql`](db/schema.sql).
 
 ### Switching AI provider (Claude in production)
 
@@ -115,7 +121,7 @@ The tool definitions, agent loop, checks and UI stay the same.
 ```bash
 npm test
 ```
-7 end-to-end tests run the real agent loop against the real Postgres database, with a fake AI that returns scripted tool calls. They cover: create → approve, "change it to 4pm" (lookup then update), reject, get all bookings, the overlap and past-time checks, another user's booking, and re-checking at approval time. They reset the database, so they need `DATABASE_URL`.
+10 end-to-end tests run the real agent loop against the real Postgres database, with a fake AI that returns scripted tool calls. They cover: create → approve, "change it to 4pm" (lookup then update), reject, get all bookings, the overlap and past-time checks, another user's booking, re-checking at approval time, relative-day labels, and cancelling (approval, history kept, slot freed, plus its checks). They reset the database, so they need `DATABASE_URL`.
 
 ## Project structure
 
