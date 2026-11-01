@@ -1,0 +1,15 @@
+# Optional: local Postgres in Docker. `docker compose up -d`, then `npm run db:setup`.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: venuvia
+      POSTGRES_PASSWORD: venuvia
+      POSTGRES_DB: venuvia
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

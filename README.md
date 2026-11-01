@@ -1,120 +1,143 @@
-# Studio Nova: Natural-Language Scheduling Assistant
+# Studio Nova: AI Booking Assistant
 
-A small web app for Venuvia's assignment. A salon owner chats with an AI assistant to manage their schedule: block time, reschedule or cancel appointments, remove blocks, and view the day. **The assistant always explains what it will do and waits for confirmation before anything changes.**
+A single-page Next.js app where a salon user chats with an AI assistant that **reads and changes bookings in a local Postgres database**. The AI does its work through function calls (`get_bookings`, `create_booking`, `update_booking`, `get_clients`), and **every change waits for the user to click Approve** before anything is written. A side panel shows live bookings and clients.
 
-![Conflict handling](docs/screenshots/4-conflict.png)
+![Approval flow](docs/screenshots/3-change-approval.png)
 
-Demo recording: [`docs/demo.webm`](docs/demo.webm). It covers the schedule view, block, confirm, the 14:00–16:00 conflict case, a reschedule, a reschedule conflict with suggested slots, an invalid date and a clarifying question. Screenshots are in [`docs/screenshots/`](docs/screenshots).
+The demo script, which is the core flow:
+1. *"Create a booking for 2pm tomorrow under a random name"* → approval card → **Approve** → the row appears
+2. *"Change it to 4pm"* → the AI calls `get_bookings` to find it, then `update_booking` → **Approve** → the row moves
+3. *"Get all bookings"* → the AI lists them
 
-## Quick start
+Screenshots of each step are in [`docs/screenshots/`](docs/screenshots).
 
-Requires Node.js 20+.
+---
 
+## Setup (WSL / Linux / macOS)
+
+You need **Node.js 22.9+** (`node -v`) and **Postgres**.
+
+### 1. Get the code and install
 ```bash
+git clone https://github.com/Azarele/venuvia-scheduler.git
+cd venuvia-scheduler
 npm install
-npm start            # http://localhost:3000
+cp .env.example .env.local
 ```
 
-By default it runs with the **rule-based mock interpreter**, so no API key is needed. To use Claude for language understanding instead:
+### 2. Start Postgres. Pick one option.
+
+**Option A, Docker** (if you have Docker Desktop):
+```bash
+docker compose up -d
+```
+
+**Option B, native install in WSL/Ubuntu:**
+```bash
+sudo apt update && sudo apt install -y postgresql
+sudo service postgresql start
+sudo -u postgres psql -c "create user venuvia with password 'venuvia' createdb;" -c "create database venuvia owner venuvia;"
+```
+
+Both match the default `DATABASE_URL` in `.env.local`. If you use your own Postgres, edit that line.
+
+### 3. Create the tables and demo data
+```bash
+npm run db:setup
+```
+This prints `Database ready: 2 users, 3 clients, 4 bookings.` Re-run it any time to reset the data.
+
+### 4. Add a free AI key
+Get a free Gemini key at **https://aistudio.google.com/apikey** and put it in `.env.local`:
+```
+AI_PROVIDER=gemini
+GEMINI_API_KEY=your-key-here
+```
+OpenRouter works the same way (`AI_PROVIDER=openrouter` + `OPENROUTER_API_KEY`, and pick a free model that supports tool calling in `OPENROUTER_MODEL`). No key at hand? `AI_PROVIDER=scripted` runs an offline pattern-matcher that handles only the three demo sentences. It is **not** an AI, and the badge says so.
+
+### 5. Run
+```bash
+npm run dev
+```
+Open **http://localhost:3000**. The badge at the top right shows which AI is active. If the key is missing, a banner explains what to set.
+
+---
+
+## How it works
+
+```
+ Browser (src/app/page.tsx)                 Server (Next.js route handlers)
+ ┌────────────────────────┐ POST /api/chat  ┌─────────────────────────────────────────────┐
+ │ Chat                   │ ──────────────▶ │ agent.ts                                    │
+ │                        │                 │  loop: send conversation + tools to the AI  │
+ │                        │                 │   ├ read tool  → run SQL, give result back  │
+ │                        │ ◀── reply +     │   └ write tool → run the checks, save as    │
+ │ [Approve] [Reject]     │   pending card  │      PENDING, stop. Nothing written yet.    │
+ │                        │ POST /api/approve                                             │
+ │                        │ ──────────────▶ │  on Approve: re-check, run SQL, tell the AI │
+ ├────────────────────────┤                 ├─────────────────────────────────────────────┤
+ │ Bookings │ Clients     │ GET /api/bookings│ bookings.ts  plain SQL + simple checks     │
+ │ (live from Postgres)   │ GET /api/clients │ db.ts        pg connection pool            │
+ └────────────────────────┘                 └──────────────────────┬──────────────────────┘
+                                                                   ▼
+                                                     Postgres: users, clients, bookings
+```
+
+- **The AI never touches the database.** It can only ask for a tool call. Our code decides what runs.
+- **Reads run straight away** (`get_bookings`, `get_clients`), and the result goes back to the AI so it can continue. That's how *"change it to 4pm"* works: it looks the booking up, then proposes the update.
+- **Writes pause for approval.** The server checks the request, stores it as a pending action (server-side, so the browser can only approve or reject by id and can't alter what runs) and shows a summary card that our code generates, not the AI. On **Approve** the checks run again in case anything changed meanwhile, then the SQL runs inside a transaction. On **Reject** nothing is written. Either way, the outcome goes back into the conversation so the AI knows what happened.
+- **Simple checks:** valid time format, end after start, not in the past, max 12 hours, the booking belongs to this user, and no overlap with the user's other bookings. Failures are returned to the AI as errors, and it explains them to the user.
+- **Dates:** the AI and UI use local salon time (`"2026-11-02 14:00"`, Europe/Warsaw). Postgres stores real `timestamptz` values, and conversion happens in one place (`src/lib/time.ts`).
+
+### Database schema: why a separate `clients` table
+
+```sql
+users    (id, name)                                      -- who owns bookings (owner / staff)
+clients  (id, name unique case-insensitive, created_at)  -- the salon's customers
+bookings (id, user_id → users, client_id → clients, service, start_at, end_at, created_at, updated_at)
+```
+
+Clients get their own table instead of a name column on each booking. One client books many times. With a copied name, a typo ("Ana" vs "Anna") splits one person into two, and a later phone or email column would have nowhere to live. All bookings live in **one** table that references both the user and the client, so nothing is stored twice. `create_booking` finds the client by name (case-insensitive) or creates them in the same transaction. See [`db/schema.sql`](db/schema.sql).
+
+### Switching AI provider (Claude in production)
+
+All providers sit behind one interface in `src/lib/ai/providers.ts`. Gemini and OpenRouter share an OpenAI-compatible adapter, and Claude has its own (the Anthropic SDK). Switching is configuration only:
+```
+AI_PROVIDER=anthropic
+ANTHROPIC_API_KEY=...
+```
+The tool definitions, agent loop, checks and UI stay the same.
+
+---
+
+## Tests
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-... npm start
-# optional: ANTHROPIC_MODEL=claude-opus-5-5 (default), AI_MODE=mock to force the mock
+npm test
 ```
-
-The badge in the top-right corner shows which interpreter is active.
-
-```bash
-npm test             # 21 tests: scheduling logic, conflict flow, parser, LLM adapter
-```
-
-> **Data is in memory.** The schedule is seeded on startup with the three appointments and the lunch break, all for *tomorrow* in Europe/Warsaw time. Every change is lost when the server restarts. The "Reset demo data" button restores the seed without a restart.
-
-## Things to try
-
-| Message | What happens |
-|---|---|
-| `Show me my appointments for tomorrow` | Lists the day in chat and jumps the timeline to it |
-| `Block tomorrow from 5 PM to 6 PM` → `yes` | Proposal → confirmation → block created |
-| `Block tomorrow from 2 PM to 4 PM` | **Conflict with Julia's 15:00 manicure.** Offers: block only 14:00–15:00 / block all and cancel Julia (explicit, red) / do nothing. A plain "yes" is not accepted here. |
-| `Reschedule my 3 PM appointment to 4 PM` | Finds Julia's appointment, keeps its 60-minute duration, asks to confirm |
-| `Move Anna to 11:30` | Refused: it overlaps Marta. Suggests nearby free slots; replying `13:30` continues the request |
-| `Block February 30 2pm-4pm` / `Block yesterday 2-4pm` / `Block tomorrow 4pm to 2pm` | Invalid date / past time / end before start |
-| `Block tomorrow afternoon` / `Block 9 to 10am` | Clarifying question ("what exact times?" / "which day?"); the answer is merged with the earlier request |
-| `Cancel my appointment` | Several match, so it asks which one |
-| `Remove the lunch break block tomorrow` | Proposal to unblock 13:00–13:30 |
-
-## Architecture
-
-```
- Browser (public/)                    Server (src/)
- ┌───────────────┐  POST /api/chat    ┌───────────────────────────────────────────────────────┐
- │ Chat panel    │ ─────────────────▶ │ assistant.js   orchestration + confirmation state     │
- │ Day timeline  │                    │   │  1. text ──▶ interpreter ──▶ intent (structured)  │
- │ (shows pending│ ◀── reply text,    │   │       ├─ interpreter/llm.js   Claude tool call    │
- │  change as a  │     proposal +     │   │       └─ interpreter/mock.js  regex fallback      │
- │  dashed box)  │     option buttons │   │  2. intent ──▶ validate + plan (read-only)        │
- │               │                    │   │  3. pending proposal stored, nothing changed yet  │
- │ [Yes] [Cancel]│  POST /api/confirm │   │  4. on confirm: re-validate, then mutate          │
- └───────────────┘ ─────────────────▶ │   ▼                                                   │
-                    GET /api/schedule │ scheduling.js  the ONLY code that mutates data        │
-                                      │ store.js       in-memory appointments + blocks        │
-                                      └───────────────────────────────────────────────────────┘
-```
-
-**The LLM never writes data.** Claude gets the message, recent conversation, current local time and the next two weeks of the schedule (with IDs). It must answer with exactly one tool call: `propose_block_time`, `propose_reschedule`, `propose_cancel_appointment`, `propose_unblock`, `show_schedule` or `ask_clarification`. These tools are not executed against data. They are typed intents. The backend then:
-
-1. **Validates** the intent: real date, valid times, end after start, not in the past, under a year ahead, and the referenced appointment or block exists.
-2. **Plans** the change read-only: conflict detection, free segments, and for reschedules opening hours plus suggested free slots.
-3. **Stores a pending proposal** for the session and returns a human-readable summary with option buttons. The timeline shows the proposed range as a dashed box.
-4. **Executes only on explicit confirmation**, either a button or a typed reply. Confirmation is handled **in code, not by the LLM**: `yes`/`no`/`1`/`2`/"cancel her appointment" are matched deterministically. Any other message drops the pending proposal without executing it.
-5. **Re-validates at execution time.** If the schedule changed after the proposal was made (e.g. a client booked online meanwhile), the change is not applied and the assistant re-asks.
-
-Both interpreters produce the same intent shape, so the whole pipeline after step 1 is identical and covered by tests. That includes the Claude path: a test injects a fake Anthropic client to verify that a tool call goes through the same validation.
-
-### Data model
-
-Same as the brief: `Appointment { id, businessId, clientName, serviceName, startAt, endAt, status }` and `AvailabilityBlock { id, businessId, startAt, endAt, reason? }`. Timestamps are stored as ISO 8601 with offset (`2026-11-02T15:00:00+01:00`), never as "tomorrow". All date math uses luxon in the business timezone (`Europe/Warsaw`), so DST transitions are handled.
-
-### Conflict rules
-
-- **Block over an appointment:** never silent. The owner chooses between blocking only the free parts, blocking everything and cancelling the named appointment(s) (shown in red), or doing nothing. A bare "yes" is treated as ambiguous for this proposal.
-- **Block over an existing block:** allowed and mentioned. A range already fully blocked is reported as "nothing to change".
-- **Reschedule into a busy or after-hours slot:** refused with the reason and up to three nearby free slots of the same length.
-- **Blocking outside opening hours:** allowed with a note, since owners may want to block evenings.
-
-## Trade-offs and decisions
-
-- **Plain JavaScript (ESM) + Express + vanilla frontend, no build step.** This fits a 2–3 hour MVP and keeps the review surface small. In a real codebase I'd use TypeScript and a component framework.
-- **Two interpreters.** Claude handles real language variety. The mock makes the app runnable and testable without a key, and is the fallback if an API call fails. The mock only covers common phrasings, by design.
-- **Claude settings:** `claude-opus-5-5` at `effort: "low"`, since translating text into one tool call is a short task and low effort keeps latency down. The server-side refusal fallback (`fallbacks: "default"`) is enabled. The model can be changed with `ANTHROPIC_MODEL`.
-- **Local date + time strings from the LLM** (`"2026-11-02"`, `"14:00"`) rather than ISO timestamps. The server applies the timezone, so the model never does offset math. Impossible dates are passed through on purpose so the backend can explain the problem instead of the model silently "fixing" Feb 30.
-- **One pending proposal per session, held in memory.** This is simple and safe: a new request replaces it, and nothing runs without an explicit choice tied to that proposal's ID.
-- **Single business, no auth, in-memory store.** All out of scope for the prototype. The store sits behind `ScheduleService`, so swapping in SQLite or Postgres touches one module.
-- **No client notifications.** Cancel and reschedule messages mention where the real platform would notify the client.
-
-## What I'd do next
-
-- Persist to a database with transactional writes, and an audit log of who changed what (owner vs assistant).
-- Undo for the last change, and multi-day blocks (e.g. "I'm on holiday next week").
-- Streaming responses, and multi-step requests in one message ("block 2–4 and move Julia to 5").
-- An eval set of real owner phrasings to measure the interpreter's accuracy, plus Polish language support.
-- Notify clients on cancel/reschedule via the platform's existing channels.
+7 end-to-end tests run the real agent loop against the real Postgres database, with a fake AI that returns scripted tool calls. They cover: create → approve, "change it to 4pm" (lookup then update), reject, get all bookings, the overlap and past-time checks, another user's booking, and re-checking at approval time. They reset the database, so they need `DATABASE_URL`.
 
 ## Project structure
 
 ```
-src/
-  server.js            Express app + REST API
-  assistant.js         conversation flow, proposals, confirmation, execution
-  scheduling.js        validation, conflict detection, mutations (ScheduleService)
-  store.js             in-memory data + seed
-  time.js              timezone helpers (Europe/Warsaw)
-  interpreter/
-    index.js           picks Claude or mock, falls back on errors
-    llm.js             Claude tool definitions + prompt
-    mock.js            rule-based parser
-public/                single-page UI (chat + day timeline)
-test/                  node:test suites
-docs/                  demo video + screenshots
+db/schema.sql, db/seed.sql     tables + demo data (npm run db:setup)
+docker-compose.yml             optional local Postgres
+src/app/page.tsx               the single page: chat + approval cards + side panels
+src/app/api/*/route.ts         chat, approve, bookings, clients, info
+src/lib/ai/agent.ts            agent loop + pending approvals
+src/lib/ai/tools.ts            tool definitions (what the AI may call)
+src/lib/ai/providers.ts        Gemini / OpenRouter / Claude adapters
+src/lib/bookings.ts            SQL queries + simple checks
+src/lib/time.ts                timezone handling
+test/agent.test.ts             end-to-end tests
 ```
+
+## Trade-offs (it's a prototype)
+
+- **Plain SQL with `pg`, no ORM.** Short and transparent, close to working with Supabase directly.
+- **No auth:** the "Signed in as" picker switches between the seeded users.
+- **Conversation kept in the browser**, sent with each request, so a page refresh starts a new chat. Pending approvals are in server memory: fine for one dev server, but production would store them in the database.
+- **Overlap check is in application code.** In production a Postgres exclusion constraint would also guard against two simultaneous writes.
+- **One change per approval.** If the AI proposes two writes at once, it's asked to propose the second after the first is resolved.
+
+The earlier Express version, built to the original brief with availability blocks and conflict options, is kept on the [`v1-express`](https://github.com/Azarele/venuvia-scheduler/tree/v1-express) branch.
