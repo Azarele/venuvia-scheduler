@@ -10,7 +10,8 @@
     "start": "next start",
     "db:setup": "node --env-file-if-exists=.env.local scripts/db-setup.mjs",
     "typecheck": "tsc --noEmit",
-    "test": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings --test \"test/**/*.test.ts\""
+    "test": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings --test \"test/**/*.test.ts\"",
+    "eval": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings scripts/eval.ts"
   },
   "engines": {
     "node": ">=22.9"

@@ -219,6 +219,7 @@ function scripted(): Provider {
         return say("Done.");
       }
 
+      if (/\bundo\b/.test(lastUser)) return call("undo_last_change", {});
       if (wantsChange || wantsCancel) return call("get_bookings", {});
       if (/\b(book|create|add|make)\b/.test(lastUser)) {
         const time = hourIn(lastUser);

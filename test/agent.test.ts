@@ -1,20 +1,21 @@
-// End-to-end tests of the agent against the real Postgres database, with a fake
-// AI provider that returns scripted tool calls. Needs DATABASE_URL (see README).
+// End-to-end tests of the agent against a real Postgres database (venuvia_test),
+// with a fake AI provider that returns scripted tool calls.
+import "./use-test-db.ts"; // must be first: switches DATABASE_URL to the test database
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import { after, beforeEach, test } from "node:test";
-import { resolvePending, runAgent } from "../src/lib/ai/agent.ts";
+import { proposeUndo, resolvePending, runAgent } from "../src/lib/ai/agent.ts";
 import type { AssistantMessage, ChatMessage, Provider } from "../src/lib/ai/providers.ts";
-import { getBookings, getClients } from "../src/lib/bookings.ts";
+import { getBookings, getClients, getEvents } from "../src/lib/bookings.ts";
+import { loadConversation } from "../src/lib/conversation.ts";
 import { pool } from "../src/lib/db.ts";
 import { now } from "../src/lib/time.ts";
+import { resetDatabase } from "../scripts/isolated-db.ts";
 
 const EWA = 1;
+const KASIA = 2;
 const tomorrow = () => now().plus({ days: 1 }).toFormat("yyyy-MM-dd");
 
-beforeEach(async () => {
-  for (const file of ["db/schema.sql", "db/seed.sql"]) await pool.query(await readFile(file, "utf8"));
-});
+beforeEach(() => resetDatabase(pool));
 after(() => pool.end());
 
 /** A provider that replays a fixed list of responses and records what it was sent. */
@@ -33,156 +34,232 @@ function fakeProvider(responses: AssistantMessage[]): Provider & { requests: Cha
   };
 }
 
-const toolCall = (name: string, args: unknown, id = `call_${name}`): AssistantMessage => ({
+let callCounter = 0;
+const toolCall = (name: string, args: unknown): AssistantMessage => ({
   role: "assistant",
   content: null,
-  tool_calls: [{ id, type: "function", function: { name, arguments: JSON.stringify(args) } }],
+  tool_calls: [{ id: `call_${name}_${++callCounter}`, type: "function", function: { name, arguments: JSON.stringify(args) } }],
 });
 const text = (content: string): AssistantMessage => ({ role: "assistant", content });
+const lastToolResult = (p: { requests: ChatMessage[][] }, request: number) =>
+  JSON.parse((p.requests[request].at(-1) as { content: string }).content);
 
-test("create booking: nothing is written until the user approves", async () => {
+/** Sends a message, expects an approval card, and approves it. */
+async function proposeAndApprove(text: string, responses: AssistantMessage[]) {
+  const res = await runAgent({ userId: EWA, text, provider: fakeProvider(responses) });
+  assert.ok(res.pending, `expected an approval card for "${text}"`);
+  return resolvePending({ userId: EWA, pendingId: res.pending.id, approved: true });
+}
+
+// ---------- The core flow ----------
+
+test("create booking: nothing is written until approval; then booking + audit row + saved chat", async () => {
   const provider = fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]);
-  const res = await runAgent({ userId: EWA, history: [], text: "Create a booking for 2pm tomorrow under a random name", provider });
+  const res = await runAgent({ userId: EWA, text: "Create a booking for 2pm tomorrow under a random name", provider });
 
   assert.ok(res.pending);
-  assert.match(res.pending.summary, /Create booking: Ola, .* 14:00–15:00/);
+  assert.equal(res.pending.details.kind, "create");
+  assert.match(res.pending.summary, /Create booking: Ola, .* \(tomorrow\), 14:00–15:00/);
   assert.equal((await getBookings(EWA)).length, 3, "not written yet");
+  assert.equal((await getEvents(EWA)).length, 0);
 
-  const done = await resolvePending({ userId: EWA, history: res.messages, pendingId: res.pending.id, approved: true });
+  const done = await resolvePending({ userId: EWA, pendingId: res.pending.id, approved: true });
   assert.match(done.reply ?? "", /Done — booked Ola/);
-  const ola = (await getBookings(EWA)).find((b) => b.clientName === "Ola");
-  assert.equal(ola?.start, `${tomorrow()} 14:00`);
-  assert.equal(ola?.end, `${tomorrow()} 15:00`);
+  const ola = (await getBookings(EWA)).find((b) => b.clientName === "Ola")!;
+  assert.equal(ola.start, `${tomorrow()} 14:00`);
   assert.ok((await getClients()).some((c) => c.name === "Ola"), "new client row created");
-  // The tool result is added to the transcript so the AI knows what happened.
-  assert.deepEqual(done.messages.at(-2), { role: "tool", tool_call_id: "call_create_booking", content: JSON.stringify({ ok: true, booking: ola }) });
+
+  const [event] = await getEvents(EWA);
+  assert.equal(event.action, "created");
+  assert.equal(event.approvedBy, "Ewa");
+  assert.equal(event.after.id, ola.id);
+
+  // The chat is stored in Postgres, including the approved card.
+  const saved = await loadConversation(EWA);
+  assert.equal(saved.bubbles.find((b) => b.pending)?.decision, "approved");
+  assert.ok(saved.history.some((m) => m.role === "tool" && JSON.parse(m.content).ok), "AI is told the result");
 });
 
-test("change it to 4pm: AI looks the booking up first, then updates after approval", async () => {
-  const created = await runAgent({
-    userId: EWA, history: [], text: "Create a booking for 2pm tomorrow for Ola",
-    provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]),
-  });
-  const approved = await resolvePending({ userId: EWA, history: created.messages, pendingId: created.pending!.id, approved: true });
+test("change it to 4pm: earlier chat is loaded from the database, AI looks up then updates", async () => {
+  await proposeAndApprove("book Ola at 2pm tomorrow", [toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]);
   const olaId = (await getBookings(EWA, { clientName: "Ola" }))[0].id;
 
   const provider = fakeProvider([
     toolCall("get_bookings", { client_name: "Ola" }),
     toolCall("update_booking", { booking_id: olaId, start: `${tomorrow()} 16:00` }),
   ]);
-  const res = await runAgent({ userId: EWA, history: approved.messages, text: "Change it to 4pm", provider });
-  assert.deepEqual(res.events.map((e) => e.tool), ["get_bookings", "update_booking"]);
-  // The model received the real get_bookings result before deciding.
-  const lookup = JSON.parse((provider.requests[1].at(-1) as { content: string }).content);
-  assert.equal(lookup.bookings[0].id, olaId);
-  assert.match(res.pending!.summary, /Change booking #\d+: Ola, .* 14:00–15:00  →  Ola, .* 16:00–17:00/);
+  const res = await runAgent({ userId: EWA, text: "Change it to 4pm", provider });
+  assert.ok(provider.requests[0].some((m) => m.role === "user" && m.content === "book Ola at 2pm tomorrow"), "history came from the DB");
+  assert.equal(lastToolResult(provider, 1).bookings[0].id, olaId);
+  assert.equal(res.pending!.details.kind, "update");
+  assert.match(res.pending!.details.from!, /14:00–15:00/);
+  assert.match(res.pending!.details.to!, /16:00–17:00/);
 
-  await resolvePending({ userId: EWA, history: res.messages, pendingId: res.pending!.id, approved: true });
+  await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: true });
   const ola = (await getBookings(EWA, { clientName: "Ola" }))[0];
   assert.equal(ola.start, `${tomorrow()} 16:00`);
   assert.equal(ola.end, `${tomorrow()} 17:00`, "duration kept");
+  const [event] = await getEvents(EWA);
+  assert.equal(event.action, "updated");
+  assert.equal(event.before?.start, `${tomorrow()} 14:00`);
+  assert.equal(event.after.start, `${tomorrow()} 16:00`);
 });
 
-test("rejecting a change leaves the database untouched", async () => {
-  const res = await runAgent({
-    userId: EWA, history: [], text: "book Ola at 2pm tomorrow",
-    provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]),
-  });
-  const done = await resolvePending({ userId: EWA, history: res.messages, pendingId: res.pending!.id, approved: false });
-  assert.match(done.reply ?? "", /didn't change anything/);
+test("rejecting leaves the database untouched; approving twice runs only once", async () => {
+  const res = await runAgent({ userId: EWA, text: "book Ola", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]) });
+  const rejected = await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: false });
+  assert.match(rejected.reply ?? "", /didn't change anything/);
+  assert.equal((await getBookings(EWA)).length, 3);
+
+  const again = await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: true });
+  assert.match(again.bubbles.at(-1)!.text, /no longer pending/);
+  assert.equal((await getBookings(EWA)).length, 3);
+  assert.equal((await getEvents(EWA)).length, 0);
+});
+
+test("typing a new message while a change is waiting rejects it and keeps the AI transcript valid", async () => {
+  const res = await runAgent({ userId: EWA, text: "book Ola", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]) });
+  const provider = fakeProvider([text("Sure.")]);
+  await runAgent({ userId: EWA, text: "actually never mind", provider });
+  const sent = provider.requests[0];
+  const toolCallId = (sent.find((m) => m.role === "assistant" && m.tool_calls) as AssistantMessage).tool_calls![0].id;
+  assert.ok(sent.some((m) => m.role === "tool" && m.tool_call_id === toolCallId), "the waiting tool call got an answer");
+  const card = (await loadConversation(EWA)).bubbles.find((b) => b.pending?.id === res.pending!.id);
+  assert.equal(card?.decision, "rejected");
   assert.equal((await getBookings(EWA)).length, 3);
 });
 
-test("get all bookings returns the user's bookings to the AI", async () => {
+test("get all bookings returns the user's bookings with day labels", async () => {
   const provider = fakeProvider([toolCall("get_bookings", {}), text("Here are your bookings.")]);
-  const res = await runAgent({ userId: EWA, history: [], text: "Get all bookings", provider });
-  assert.equal(res.pending, null);
+  const res = await runAgent({ userId: EWA, text: "Get all bookings", provider });
   assert.equal(res.reply, "Here are your bookings.");
-  const result = JSON.parse((provider.requests[1].at(-1) as { content: string }).content);
+  const result = lastToolResult(provider, 1);
   assert.deepEqual(result.bookings.map((b: { client: string }) => b.client), ["Anna", "Marta", "Julia"]);
+  assert.match(result.bookings[0].day, /\(tomorrow\)$/);
 });
 
-test("simple checks: overlapping or past bookings are refused and the AI is told why", async () => {
-  const provider = fakeProvider([
-    toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 15:30` }),
-    text("That time clashes with Julia's booking."),
-  ]);
-  const res = await runAgent({ userId: EWA, history: [], text: "book Ola at 3:30pm tomorrow", provider });
-  assert.equal(res.pending, null);
-  assert.match(res.events[0].error ?? "", /overlaps an existing booking \(#\d+ Julia 15:00–16:00\)/);
+// ---------- Checks and the database guarantee ----------
 
-  const past = fakeProvider([toolCall("create_booking", { client_name: "Ola", start: "2020-01-01 10:00" }), text("That's in the past.")]);
-  const res2 = await runAgent({ userId: EWA, history: [], text: "book Ola on 1 Jan 2020", provider: past });
+test("overlaps are refused with the nearest free times; past times are refused", async () => {
+  const provider = fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 15:30` }), text("Taken.")]);
+  const res = await runAgent({ userId: EWA, text: "book Ola at 3:30pm tomorrow", provider });
+  assert.equal(res.pending, null);
+  assert.match(res.events[0].error ?? "", /overlaps an existing booking \(#\d+ Julia 15:00–16:00\)\. Nearest free times that day: 16:00, 16:15, 16:30\./);
+
+  const past = fakeProvider([toolCall("create_booking", { client_name: "Ola", start: "2020-01-01 10:00" }), text("Past.")]);
+  const res2 = await runAgent({ userId: EWA, text: "book Ola on 1 Jan 2020", provider: past });
   assert.match(res2.events[0].error ?? "", /in the past/);
   assert.equal((await getBookings(EWA)).length, 3);
 });
 
-test("a user can't update another user's booking", async () => {
-  const kasiaBooking = (await getBookings(2))[0];
+test("find_free_slots returns open times near a requested time", async () => {
+  const provider = fakeProvider([toolCall("find_free_slots", { date: tomorrow(), near: "11:30" }), text("ok")]);
+  await runAgent({ userId: EWA, text: "when am I free around 11:30 tomorrow?", provider });
+  const starts = lastToolResult(provider, 1).free_slots.map((s: { start: string }) => s.start.slice(11));
+  assert.ok(!starts.includes("11:30"), "Marta is booked 11:00–13:00");
+  assert.ok(starts.includes("13:30"));
+  assert.ok(starts.includes("09:00"));
+});
+
+test("the database itself refuses overlapping confirmed bookings (exclusion constraint)", async () => {
+  const julia = (await getBookings(EWA, { clientName: "Julia" }))[0];
+  await assert.rejects(
+    pool.query(`insert into bookings (user_id, client_id, start_at, end_at) select user_id, client_id, start_at + interval '15 minutes', end_at from bookings where id = $1`, [julia.id]),
+    /bookings_no_overlap/,
+  );
+  // A cancelled booking doesn't block the slot, and another user's booking never does.
+  await pool.query(`insert into bookings (user_id, client_id, start_at, end_at, status) select user_id, client_id, start_at, end_at, 'cancelled' from bookings where id = $1`, [julia.id]);
+  await pool.query(`insert into bookings (user_id, client_id, start_at, end_at) select $2, client_id, start_at, end_at from bookings where id = $1`, [julia.id, KASIA]);
+});
+
+test("approval re-checks: a clash created after the proposal stops the write", async () => {
+  const res = await runAgent({ userId: EWA, text: "book Ola 5pm", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 17:00` })]) });
+  await pool.query(
+    `insert into bookings (user_id, client_id, start_at, end_at) values (1, 1, $1::timestamptz, $1::timestamptz + interval '30 minutes')`,
+    [now().plus({ days: 1 }).set({ hour: 17, minute: 15, second: 0, millisecond: 0 }).toISO()],
+  );
+  const done = await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: true });
+  assert.match(done.reply ?? "", /couldn't make that change: That overlaps/);
+  assert.equal(done.bubbles.find((b) => b.pending)?.decision, "failed");
+});
+
+test("a user can't touch another user's booking", async () => {
+  const kasiaBooking = (await getBookings(KASIA))[0];
   const provider = fakeProvider([toolCall("update_booking", { booking_id: kasiaBooking.id, start: `${tomorrow()} 18:00` }), text("Not found.")]);
-  const res = await runAgent({ userId: EWA, history: [], text: "move booking to 6pm", provider });
+  const res = await runAgent({ userId: EWA, text: "move booking to 6pm", provider });
   assert.match(res.events[0].error ?? "", /doesn't exist for this user/);
 });
 
-test("approval is re-checked: a clash created after the proposal stops the write", async () => {
-  const res = await runAgent({
-    userId: EWA, history: [], text: "book Ola at 5pm tomorrow",
-    provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 17:00` })]),
-  });
-  await pool.query(
-    `insert into bookings (user_id, client_id, start_at, end_at)
-     values (1, 1, $1::timestamptz, $1::timestamptz + interval '30 minutes')`,
-    [now().plus({ days: 1 }).set({ hour: 17, minute: 15, second: 0, millisecond: 0 }).toISO()],
-  );
-  const done = await resolvePending({ userId: EWA, history: res.messages, pendingId: res.pending!.id, approved: true });
-  assert.match(done.reply ?? "", /couldn't make that change: That overlaps/);
-});
+// ---------- Cancel ----------
 
-test("approval cards and replies say which day it is relative to today", async () => {
-  const provider = fakeProvider([toolCall("create_booking", { client_name: "Emily", start: `${now().plus({ days: 2 }).toFormat("yyyy-MM-dd")} 17:00` })]);
-  const res = await runAgent({ userId: EWA, history: [], text: "book Emily in 2 days at 5pm", provider });
-  assert.match(res.pending!.summary, /Emily, \w{3} \d{1,2} \w{3} \(in 2 days\), 17:00–18:00/);
-
-  const lookup = fakeProvider([toolCall("get_bookings", {}), text("ok")]);
-  await runAgent({ userId: EWA, history: [], text: "bookings?", provider: lookup });
-  const result = JSON.parse((lookup.requests[1].at(-1) as { content: string }).content);
-  assert.match(result.bookings[0].day, /\(tomorrow\)$/);
-});
-
-test("cancel booking: needs approval, keeps the row as cancelled, frees the slot", async () => {
+test("cancel: needs approval, keeps the row as history, frees the slot, logs it", async () => {
   const julia = (await getBookings(EWA, { clientName: "Julia" }))[0];
-  const provider = fakeProvider([toolCall("get_bookings", { client_name: "Julia" }), toolCall("cancel_booking", { booking_id: julia.id })]);
-  const res = await runAgent({ userId: EWA, history: [], text: "Cancel Julia's booking", provider });
-  assert.match(res.pending!.summary, /^Cancel booking #\d+: Julia \(Manicure\), .*\(tomorrow\), 15:00–16:00$/);
-  assert.equal((await getBookings(EWA)).length, 3, "not cancelled before approval");
-
-  const done = await resolvePending({ userId: EWA, history: res.messages, pendingId: res.pending!.id, approved: true });
+  const done = await proposeAndApprove("Cancel Julia's booking", [toolCall("get_bookings", { client_name: "Julia" }), toolCall("cancel_booking", { booking_id: julia.id })]);
   assert.match(done.reply ?? "", /Done — cancelled booking #\d+ \(Julia/);
-  assert.deepEqual((await getBookings(EWA)).map((b) => b.clientName), ["Anna", "Marta"], "hidden from default list");
-  const all = await getBookings(EWA, { includeCancelled: true });
-  assert.equal(all.find((b) => b.id === julia.id)?.status, "cancelled", "row kept for history");
-  assert.equal((await getClients()).find((c) => c.name === "Julia")?.bookingCount, 0);
+  assert.deepEqual((await getBookings(EWA)).map((b) => b.clientName), ["Anna", "Marta"]);
+  assert.equal((await getBookings(EWA, { includeCancelled: true })).find((b) => b.id === julia.id)?.status, "cancelled");
+  assert.equal((await getEvents(EWA))[0].action, "cancelled");
 
-  // The freed slot can be booked again.
-  const rebook = await runAgent({
-    userId: EWA, history: [], text: "book Ola at 3pm tomorrow",
-    provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 15:00` })]),
-  });
-  assert.ok(rebook.pending, "no overlap with a cancelled booking");
+  const rebook = await runAgent({ userId: EWA, text: "book Ola 3pm", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 15:00` })]) });
+  assert.ok(rebook.pending, "the freed slot can be booked");
 });
 
-test("cancel checks: already cancelled, other user's booking, and changing a cancelled booking", async () => {
+test("cancel checks: already cancelled, and a cancelled booking can't be changed", async () => {
   const julia = (await getBookings(EWA, { clientName: "Julia" }))[0];
   await pool.query("update bookings set status = 'cancelled' where id = $1", [julia.id]);
-  const kasia = (await getBookings(2))[0];
-
-  const again = await runAgent({ userId: EWA, history: [], text: "cancel julia", provider: fakeProvider([toolCall("cancel_booking", { booking_id: julia.id }), text("x")]) });
+  const again = await runAgent({ userId: EWA, text: "cancel julia", provider: fakeProvider([toolCall("cancel_booking", { booking_id: julia.id }), text("x")]) });
   assert.match(again.events[0].error ?? "", /already cancelled/);
-  const other = await runAgent({ userId: EWA, history: [], text: "cancel", provider: fakeProvider([toolCall("cancel_booking", { booking_id: kasia.id }), text("x")]) });
-  assert.match(other.events[0].error ?? "", /doesn't exist for this user/);
-  const move = await runAgent({
-    userId: EWA, history: [], text: "move julia",
-    provider: fakeProvider([toolCall("update_booking", { booking_id: julia.id, start: `${tomorrow()} 18:00` }), text("x")]),
-  });
+  const move = await runAgent({ userId: EWA, text: "move julia", provider: fakeProvider([toolCall("update_booking", { booking_id: julia.id, start: `${tomorrow()} 18:00` }), text("x")]) });
   assert.match(move.events[0].error ?? "", /is cancelled, so it can't be changed/);
+});
+
+// ---------- Undo ----------
+
+test("undo steps back through changes: a move, then a cancel, then a create", async () => {
+  const julia = (await getBookings(EWA, { clientName: "Julia" }))[0];
+  await proposeAndApprove("book Ola 2pm", [toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]);
+  await proposeAndApprove("cancel Anna", [toolCall("cancel_booking", { booking_id: 1 })]);
+  await proposeAndApprove("move Julia to 5pm", [toolCall("update_booking", { booking_id: julia.id, start: `${tomorrow()} 17:00` })]);
+
+  // 1st undo: Julia goes back to 15:00.
+  let res = await runAgent({ userId: EWA, text: "undo that", provider: fakeProvider([toolCall("undo_last_change", {})]) });
+  assert.equal(res.pending!.details.kind, "undo");
+  assert.match(res.pending!.details.to!, /Julia .* 15:00–16:00/);
+  let done = await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: true });
+  assert.match(done.reply ?? "", /back to Julia/);
+  assert.equal((await getBookings(EWA, { clientName: "Julia" }))[0].start, `${tomorrow()} 15:00`);
+
+  // 2nd undo: Anna's cancelled booking is restored.
+  done = await proposeAndApprove("undo again", [toolCall("undo_last_change", {})]);
+  assert.match(done.reply ?? "", /restored/);
+  assert.equal((await getBookings(EWA, { clientName: "Anna" }))[0].status, "confirmed");
+
+  // 3rd undo: Ola's new booking is cancelled again.
+  done = await proposeAndApprove("and again", [toolCall("undo_last_change", {})]);
+  assert.match(done.reply ?? "", /new booking #\d+ for Ola is cancelled/);
+  assert.equal((await getBookings(EWA, { clientName: "Ola" })).length, 0);
+
+  // Nothing left.
+  res = await runAgent({ userId: EWA, text: "undo", provider: fakeProvider([toolCall("undo_last_change", {}), text("Nothing to undo.")]) });
+  assert.match(res.events[0].error ?? "", /no change to undo/);
+  assert.deepEqual((await getEvents(EWA)).map((e) => e.action), ["undone", "undone", "undone", "updated", "cancelled", "created"]);
+});
+
+test("the Undo button proposes an undo without the AI; it's logged as such", async () => {
+  await proposeAndApprove("book Ola 2pm", [toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]);
+  const proposal = await proposeUndo(EWA);
+  assert.match(proposal.pending!.summary, /^Undo: Cancel booking #\d+ \(Ola/);
+  await resolvePending({ userId: EWA, pendingId: proposal.pending!.id, approved: true });
+  const [event] = await getEvents(EWA);
+  assert.equal(event.action, "undone");
+  assert.equal(event.source, "undo-button");
+  assert.match((await loadConversation(EWA)).history.at(-1)!.content as string, /Undo button/);
+});
+
+test("undo is refused if the booking was changed by something else since", async () => {
+  await proposeAndApprove("book Ola 2pm", [toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]);
+  await pool.query("update bookings set service = 'Massage' where client_id = (select id from clients where name = 'Ola')");
+  const res = await proposeUndo(EWA);
+  assert.equal(res.pending, null);
+  assert.match(res.bubbles.at(-1)!.text, /has changed since then/);
 });

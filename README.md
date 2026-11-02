@@ -1,24 +1,28 @@
 # Studio Nova: AI Booking Assistant
 
-A single-page Next.js app where a salon user chats with an AI assistant that **reads and changes bookings in a local Postgres database**. The AI does its work through function calls (`get_bookings`, `get_clients`, `create_booking`, `update_booking`, `cancel_booking`), and **every change waits for the user to click Approve** before anything is written. A side panel shows live bookings and clients.
+A single-page Next.js app where a salon user chats with an AI assistant that **reads and changes bookings in a local Postgres database**. The AI works only through function calls, and **every change waits for the user to click Approve**. Each approved change is written to an **audit log** together with the state before it, so any change can be **undone**.
 
-![Approval flow](docs/screenshots/3-change-approval.png)
+![Approval card](docs/screenshots/2-change-approval.png)
 
-The demo script, which is the core flow:
-1. *"Create a booking for 2pm tomorrow under a random name"* → approval card → **Approve** → the row appears
-2. *"Change it to 4pm"* → the AI calls `get_bookings` to find it, then `update_booking` → **Approve** → the row moves
-3. *"Get all bookings"* → the AI lists them
-4. *"Cancel Julia's booking"* → lookup, then `cancel_booking` → red **Approve cancellation** → the row stays in the panel, struck through and marked cancelled
+| What it does | How |
+|---|---|
+| Book, move, cancel, look up | AI tools: `get_bookings`, `get_clients`, `find_free_slots`, `create_booking`, `update_booking`, `cancel_booking`, `undo_last_change` |
+| Never changes data on its own | Write tools only create a *pending action*; our code runs it after **Approve**, re-checking first |
+| Suggests alternatives | When a time is taken, the error includes the nearest free times, and the AI offers them |
+| Audit log | `booking_events`: every approved change, who approved it, before and after, in the same transaction |
+| Undo | Reverses the last change (repeat to step back). From the chat ("undo that") or the **Undo last change** button; still needs approval |
+| No double bookings, guaranteed | A Postgres **exclusion constraint** rejects overlapping confirmed bookings, even if two requests race |
+| Survives refreshes and restarts | Chat history and pending approvals are stored in Postgres |
+| Measured, not guessed | `npm run eval` scores the AI on 18 realistic requests |
 
-Screenshots of each step are in [`docs/screenshots/`](docs/screenshots).
+Screenshots of the full flow (create → change → cancel → undo → activity log) are in [`docs/screenshots/`](docs/screenshots).
 
 ---
 
 ## Setup (WSL / Linux / macOS)
 
-You need **Node.js 22.9+** (`node -v`) and **Postgres**.
+You need **Node.js 22.9+** (`node -v`) and **Postgres** (16 recommended).
 
-### 1. Get the code and install
 ```bash
 git clone https://github.com/Azarele/venuvia-scheduler.git
 cd venuvia-scheduler
@@ -26,124 +30,132 @@ npm install
 cp .env.example .env.local
 ```
 
-### 2. Start Postgres. Pick one option.
+**Postgres.** Pick one:
+- Docker: `docker compose up -d`
+- Native (WSL/Ubuntu):
+  ```bash
+  sudo apt install -y postgresql && sudo service postgresql start
+  sudo -u postgres psql -c "create user venuvia with password 'venuvia' createdb;" -c "create database venuvia owner venuvia;"
+  ```
+  Run `pg_lsclusters`. If the port isn't 5432, change it in `DATABASE_URL` in `.env.local`.
 
-**Option A, Docker** (if you have Docker Desktop):
-```bash
-docker compose up -d
-```
-
-**Option B, native install in WSL/Ubuntu:**
-```bash
-sudo apt update && sudo apt install -y postgresql
-sudo service postgresql start
-sudo -u postgres psql -c "create user venuvia with password 'venuvia' createdb;" -c "create database venuvia owner venuvia;"
-```
-
-Both match the default `DATABASE_URL` in `.env.local`. If you use your own Postgres, edit that line.
-
-### 3. Create the tables and demo data
+**Tables and demo data.** Re-run this any time to reset:
 ```bash
 npm run db:setup
 ```
-This prints `Database ready: 2 users, 3 clients, 4 bookings.` Re-run it any time to reset the data.
 
-### 4. Add a free AI key
-Get a free Gemini key at **https://aistudio.google.com/apikey** and put it in `.env.local`:
+**AI key.** Get a free Gemini key at https://aistudio.google.com/apikey and put it in `.env.local`:
 ```
 AI_PROVIDER=gemini
-GEMINI_API_KEY=your-key-here
+GEMINI_API_KEY=your-key
 ```
-OpenRouter works the same way (`AI_PROVIDER=openrouter` + `OPENROUTER_API_KEY`, and pick a free model that supports tool calling in `OPENROUTER_MODEL`). No key at hand? `AI_PROVIDER=scripted` runs an offline pattern-matcher that handles only the three demo sentences. It is **not** an AI, and the badge says so.
+OpenRouter works the same way (`AI_PROVIDER=openrouter`, `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`). For production use Claude (`AI_PROVIDER=anthropic`, `ANTHROPIC_API_KEY`). `AI_PROVIDER=scripted` is an offline pattern-matcher for the demo sentences only. It is **not** an AI, and the badge says so.
 
-### 5. Run
+**Run:**
 ```bash
-npm run dev
+npm run dev     # http://localhost:3000
 ```
-Open **http://localhost:3000**. The badge at the top right shows which AI is active. If the key is missing, a banner explains what to set.
 
-> **"Tomorrow" means tomorrow in salon time** (`Europe/Warsaw` by default). If you test from another timezone late in the evening, the salon may already be on the next day. Set `BUSINESS_TIMEZONE` in `.env.local` (e.g. `Europe/London`) to match your clock. Approval cards always show the relative day, e.g. `Tue 3 Nov (tomorrow)`, so a wrong day is easy to spot before approving.
+> **Timezone:** "tomorrow" means tomorrow in **salon time** (`BUSINESS_TIMEZONE`, default `Europe/Warsaw`). Testing from elsewhere late in the evening? Set it to your own zone, e.g. `BUSINESS_TIMEZONE=Europe/London`. Opening hours default to 09:00–19:00 (`BUSINESS_OPEN` / `BUSINESS_CLOSE`).
 
 ---
 
 ## How it works
 
 ```
- Browser (src/app/page.tsx)                 Server (Next.js route handlers)
- ┌────────────────────────┐ POST /api/chat  ┌─────────────────────────────────────────────┐
- │ Chat                   │ ──────────────▶ │ agent.ts                                    │
- │                        │                 │  loop: send conversation + tools to the AI  │
- │                        │                 │   ├ read tool  → run SQL, give result back  │
- │                        │ ◀── reply +     │   └ write tool → run the checks, save as    │
- │ [Approve] [Reject]     │   pending card  │      PENDING, stop. Nothing written yet.    │
- │                        │ POST /api/approve                                             │
- │                        │ ──────────────▶ │  on Approve: re-check, run SQL, tell the AI │
- ├────────────────────────┤                 ├─────────────────────────────────────────────┤
- │ Bookings │ Clients     │ GET /api/bookings│ bookings.ts  plain SQL + simple checks     │
- │ (live from Postgres)   │ GET /api/clients │ db.ts        pg connection pool            │
- └────────────────────────┘                 └──────────────────────┬──────────────────────┘
-                                                                   ▼
-                                                     Postgres: users, clients, bookings
+ Browser                                    Server (Next.js route handlers)
+ ┌──────────────────────┐ POST /api/chat    ┌──────────────────────────────────────────────┐
+ │ Chat                 │ ────────────────▶ │ agent.ts — loads the chat from Postgres      │
+ │                      │                   │  loop: conversation + tools → AI             │
+ │                      │                   │   ├ read tool  → SQL, result back to the AI  │
+ │                      │ ◀── approval card │   └ write tool → checks, save PENDING, stop  │
+ │ [Approve] [Reject]   │ POST /api/approve │                                              │
+ │                      │ ────────────────▶ │  Approve: claim pending (once only) → re-check│
+ │                      │                   │   → change + audit row in ONE transaction    │
+ ├──────────────────────┤                   ├──────────────────────────────────────────────┤
+ │ Schedule │ Clients   │ GET /api/bookings │ bookings.ts   SQL + simple checks + undo     │
+ │ Activity + Undo      │ GET /api/events   │ conversation.ts  chat + pending approvals    │
+ └──────────────────────┘ POST /api/undo    └───────────────────────┬──────────────────────┘
+                                                                    ▼
+                           Postgres: users · clients · bookings · booking_events
+                                     · pending_actions · conversations
 ```
 
-- **The AI never touches the database.** It can only ask for a tool call. Our code decides what runs.
-- **Reads run straight away** (`get_bookings`, `get_clients`), and the result goes back to the AI so it can continue. That's how *"change it to 4pm"* works: it looks the booking up, then proposes the update.
-- **Writes pause for approval.** The server checks the request, stores it as a pending action (server-side, so the browser can only approve or reject by id and can't alter what runs) and shows a summary card that our code generates, not the AI. On **Approve** the checks run again in case anything changed meanwhile, then the SQL runs inside a transaction. On **Reject** nothing is written. Either way, the outcome goes back into the conversation so the AI knows what happened.
-- **Simple checks:** valid time format, end after start, not in the past, max 12 hours, the booking belongs to this user, no overlap with the user's other confirmed bookings, cancelled bookings can't be changed or cancelled twice, and past bookings can't be cancelled. Failures are returned to the AI as errors, and it explains them to the user.
-- **Dates:** the AI and UI use local salon time (`"2026-11-02 14:00"`, Europe/Warsaw). Postgres stores real `timestamptz` values, and conversion happens in one place (`src/lib/time.ts`).
+1. **The AI never touches the database.** It can only request a tool call; our code decides what runs.
+2. **Reads run straight away**, and the result goes back to the AI. That's how *"change it to 4pm"* works: it looks the booking up, then proposes the update.
+3. **Writes pause.** The request is checked and stored in `pending_actions`, and the user sees an approval card (generated by our code, not the AI) showing **From → To**. The browser can only answer approve/reject by id; it can't alter what will run.
+4. **On Approve,** the pending row is claimed atomically, so a double-click can't run it twice. The checks run again, then the booking change **and** the audit row are written in one transaction. On Reject, nothing is written. Either way, the outcome goes back into the conversation so the AI knows what happened.
+5. **Typing something new** while a change is waiting rejects the waiting change, so the AI's transcript always stays valid.
 
-### Database schema: why a separate `clients` table
+**Simple checks:** valid time, end after start, not in the past, at most 12 hours, the booking belongs to this user, no overlap with the user's confirmed bookings (with the nearest free times suggested), no changing or re-cancelling a cancelled booking, and no cancelling a booking that already happened.
+
+### Database
 
 ```sql
-users    (id, name)                                      -- who owns bookings (owner / staff)
-clients  (id, name unique case-insensitive, created_at)  -- the salon's customers
-bookings (id, user_id → users, client_id → clients, service, start_at, end_at,
-          status 'confirmed' | 'cancelled', cancelled_at, created_at, updated_at)
+users            (id, name)
+clients          (id, name — unique case-insensitive)
+bookings         (id, user_id → users, client_id → clients, service, start_at, end_at,
+                  status 'confirmed'|'cancelled', cancelled_at, created_at, updated_at)
+                  + EXCLUDE (user_id =, tstzrange(start_at, end_at) &&) WHERE status = 'confirmed'
+booking_events   (id, booking_id, action 'created'|'updated'|'cancelled'|'undone',
+                  before jsonb, after jsonb, approved_by → users, source 'ai'|'undo-button',
+                  undoes_event_id, created_at)
+pending_actions  (id uuid, user_id, tool, args, tool_call_id, summary, status, created_at, resolved_at)
+conversations    (user_id, history jsonb, bubbles jsonb, updated_at)
 ```
 
-Clients get their own table instead of a name column on each booking. One client books many times. With a copied name, a typo ("Ana" vs "Anna") splits one person into two, and a later phone or email column would have nowhere to live. All bookings live in **one** table that references both the user and the client, so nothing is stored twice. `create_booking` finds the client by name (case-insensitive) or creates them in the same transaction.
+- **Separate `clients` table:** one client books many times. A name copied onto every booking drifts ("Ana" vs "Anna") and has nowhere to keep a phone or email later. All bookings live in **one** table that references both user and client, so nothing is stored twice.
+- **Cancel = `status`, not delete:** history stays, and the slot is freed (the overlap constraint only counts confirmed bookings).
+- **Overlap protection in two layers:** the app checks first to give a friendly message with free-time suggestions, and the exclusion constraint (`btree_gist`) is the guarantee when two requests race.
+- **Audit log in the same transaction as the change:** a change can't happen without its log row, and vice versa.
+- **Undo** finds the user's latest change that hasn't been undone, checks the booking still looks exactly as that change left it (otherwise it refuses), and restores the `before` state. A unique index makes each change undoable only once.
 
-Cancelling sets `status = 'cancelled'` instead of deleting the row. The history stays (who cancelled what, and when), while cancelled bookings no longer block the slot or count in the Clients panel. See [`db/schema.sql`](db/schema.sql).
+### AI providers (Claude in production)
 
-### Switching AI provider (Claude in production)
-
-All providers sit behind one interface in `src/lib/ai/providers.ts`. Gemini and OpenRouter share an OpenAI-compatible adapter, and Claude has its own (the Anthropic SDK). Switching is configuration only:
-```
-AI_PROVIDER=anthropic
-ANTHROPIC_API_KEY=...
-```
-The tool definitions, agent loop, checks and UI stay the same.
+`src/lib/ai/providers.ts` has one interface with adapters for Gemini and OpenRouter (OpenAI-compatible) and Claude (Anthropic SDK). Switching provider is configuration only (`AI_PROVIDER` + key); the tools, checks, approval flow and UI don't change. Only the last ~40 messages are sent to the AI, which keeps each call small and cheap.
 
 ---
 
-## Tests
+## Tests and eval
 
 ```bash
-npm test
+npm test         # 15 end-to-end tests
+npm run eval     # scores the real AI on 18 realistic requests
 ```
-10 end-to-end tests run the real agent loop against the real Postgres database, with a fake AI that returns scripted tool calls. They cover: create → approve, "change it to 4pm" (lookup then update), reject, get all bookings, the overlap and past-time checks, another user's booking, re-checking at approval time, relative-day labels, and cancelling (approval, history kept, slot freed, plus its checks). They reset the database, so they need `DATABASE_URL`.
+
+**Tests** run the real agent loop and real SQL against a separate **`venuvia_test`** database (created automatically; your data is never touched), with a fake AI that returns scripted tool calls. They cover the approval flow, audit rows, chat persistence, double-approve, moving on while a change waits, overlap suggestions, the database constraint, re-checks at approval, other users' bookings, cancel, multi-step undo, the Undo button, and undo refusing when a booking changed in between.
+
+**The eval** sends realistic phrasings to whichever AI is configured, such as *"Push Anna's haircut back by 30 minutes"*, *"Cancel tomorrow's 3pm"*, *"Book a client tomorrow at 2"* (it should ask who) and *"Book Ola at 3:30pm"* (a clash, so it should offer free times). It checks the tool and arguments the AI picks. It runs on a separate **`venuvia_eval`** database and never approves anything. The output looks like this (illustrative, not a real result):
+
+```
+Eval: Gemini · gemini-flash-latest · 18 cases
+✓  1. Create a booking for 2pm tomorrow under a random name  (2.1s)
+✗  7. Push Anna's haircut back by 30 minutes  (3.4s)
+      expected: update_booking #1 start 2026-11-03 10:30
+      got:      update_booking {"booking_id":1,"start":"2026-11-03 10:00"}
+...
+N/18 passed · avg X.Xs per message
+```
+
+Run it with each model you're considering (`AI_PROVIDER` / `*_MODEL`) to pick the cheapest one that passes. `npm run eval -- julia` runs only matching cases, and `EVAL_DELAY_MS` spaces requests out for free-tier rate limits (default 4s).
 
 ## Project structure
 
 ```
-db/schema.sql, db/seed.sql     tables + demo data (npm run db:setup)
-docker-compose.yml             optional local Postgres
-src/app/page.tsx               the single page: chat + approval cards + side panels
-src/app/api/*/route.ts         chat, approve, bookings, clients, info
-src/lib/ai/agent.ts            agent loop + pending approvals
-src/lib/ai/tools.ts            tool definitions (what the AI may call)
-src/lib/ai/providers.ts        Gemini / OpenRouter / Claude adapters
-src/lib/bookings.ts            SQL queries + simple checks
-src/lib/time.ts                timezone handling
-test/agent.test.ts             end-to-end tests
+db/schema.sql, db/seed.sql        tables, constraint, audit log + demo data (npm run db:setup)
+src/app/page.tsx                  the page: state + wiring
+src/app/components/Chat.tsx       chat, tool chips, approval cards
+src/app/components/SidePanel.tsx  Schedule / Clients / Activity (+ Undo) tabs
+src/app/api/*/route.ts            chat, approve, undo, conversation, bookings, clients, events, info
+src/lib/ai/agent.ts               agent loop, pending approvals, Undo button
+src/lib/ai/tools.ts               tool definitions + previews for approval cards
+src/lib/ai/providers.ts           Gemini / OpenRouter / Claude adapters
+src/lib/bookings.ts               SQL, checks, free slots, audit log, undo
+src/lib/conversation.ts           chat + pending approvals in Postgres
+scripts/eval.ts                   AI eval
+test/agent.test.ts                end-to-end tests
 ```
 
-## Trade-offs (it's a prototype)
+## Left for production
 
-- **Plain SQL with `pg`, no ORM.** Short and transparent, close to working with Supabase directly.
-- **No auth:** the "Signed in as" picker switches between the seeded users.
-- **Conversation kept in the browser**, sent with each request, so a page refresh starts a new chat. Pending approvals are in server memory: fine for one dev server, but production would store them in the database.
-- **Overlap check is in application code.** In production a Postgres exclusion constraint would also guard against two simultaneous writes.
-- **One change per approval.** If the AI proposes two writes at once, it's asked to propose the second after the first is resolved.
-
-The earlier Express version, built to the original brief with availability blocks and conflict options, is kept on the [`v1-express`](https://github.com/Azarele/venuvia-scheduler/tree/v1-express) branch.
+Authentication (the user picker stands in for login), client notifications, multi-staff scheduling rules, and real-time sync between tabs. The earlier Express version built to the original brief is on the [`v1-express`](https://github.com/Azarele/venuvia-scheduler/tree/v1-express) branch.

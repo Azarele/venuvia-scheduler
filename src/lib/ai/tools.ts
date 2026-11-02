@@ -5,13 +5,17 @@ import {
   cancelBooking,
   checkCancel,
   checkCreate,
+  checkUndo,
   checkUpdate,
   createBooking,
   describeBooking,
+  findFreeSlots,
   getBookings,
   getClients,
+  undoLastChange,
   updateBooking,
 } from "../bookings.ts";
+import type { PendingDetails } from "../chat-types.ts";
 import { formatDay, formatLocal, parseLocal } from "../time.ts";
 
 export type ToolDef = {
@@ -22,6 +26,7 @@ export type ToolDef = {
 };
 
 const LOCAL_TIME = 'Local salon time as "YYYY-MM-DD HH:mm", e.g. "2026-11-02 14:00".';
+const APPROVAL = "Needs the user's approval in the app before it happens.";
 
 export const TOOLS: ToolDef[] = [
   {
@@ -41,14 +46,28 @@ export const TOOLS: ToolDef[] = [
   {
     name: "get_clients",
     kind: "read",
-    description: "List all clients with how many bookings they have.",
+    description: "List all clients with how many active bookings they have.",
     parameters: { type: "object", properties: {} },
+  },
+  {
+    name: "find_free_slots",
+    kind: "read",
+    description:
+      "Find free start times on a day within opening hours for the current user. Use it when a requested time is taken, or when the user asks when they're free.",
+    parameters: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: '"YYYY-MM-DD"' },
+        duration_minutes: { type: "integer", description: "Length needed; defaults to 60." },
+        near: { type: "string", description: 'Optional "HH:mm"; returns the free times closest to it.' },
+      },
+      required: ["date"],
+    },
   },
   {
     name: "create_booking",
     kind: "write",
-    description:
-      "Create a booking for the current user. The client is created if they don't exist yet. Needs the user's approval in the app before it happens.",
+    description: `Create a booking for the current user. The client is created if they don't exist yet. ${APPROVAL}`,
     parameters: {
       type: "object",
       properties: {
@@ -63,8 +82,7 @@ export const TOOLS: ToolDef[] = [
   {
     name: "update_booking",
     kind: "write",
-    description:
-      "Change an existing booking: time, client or service. Only pass the fields that change; if only the start changes, the length stays the same. Needs the user's approval in the app before it happens.",
+    description: `Change an existing booking: time, client or service. Only pass the fields that change; if only the start changes, the length stays the same. ${APPROVAL}`,
     parameters: {
       type: "object",
       properties: {
@@ -80,15 +98,18 @@ export const TOOLS: ToolDef[] = [
   {
     name: "cancel_booking",
     kind: "write",
-    description:
-      "Cancel an existing booking. The booking is kept in history as cancelled and its time slot becomes free. Needs the user's approval in the app before it happens.",
+    description: `Cancel an existing booking. It's kept in history as cancelled and its time slot becomes free. ${APPROVAL}`,
     parameters: {
       type: "object",
-      properties: {
-        booking_id: { type: "integer", description: "Id from get_bookings." },
-      },
+      properties: { booking_id: { type: "integer", description: "Id from get_bookings." } },
       required: ["booking_id"],
     },
+  },
+  {
+    name: "undo_last_change",
+    kind: "write",
+    description: `Reverse the user's most recent change (create, change or cancel). Calling it again steps further back. ${APPROVAL}`,
+    parameters: { type: "object", properties: {} },
   },
 ];
 
@@ -96,12 +117,15 @@ export const findTool = (name: string) => TOOLS.find((t) => t.name === name);
 
 type Args = Record<string, unknown>;
 type Ctx = { userId: number };
+type WriteCtx = Ctx & { source: "ai" | "undo-button" };
+
+const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
 
 export async function runReadTool(name: string, args: Args, ctx: Ctx): Promise<unknown> {
   if (name === "get_bookings") {
     const bookings = await getBookings(ctx.userId, {
-      date: typeof args.date === "string" && args.date ? args.date : undefined,
-      clientName: typeof args.client_name === "string" && args.client_name ? args.client_name : undefined,
+      date: str(args.date),
+      clientName: str(args.client_name),
       includeCancelled: args.include_cancelled === true,
     });
     return {
@@ -116,55 +140,81 @@ export async function runReadTool(name: string, args: Args, ctx: Ctx): Promise<u
       })),
     };
   }
-  if (name === "get_clients") {
-    return { clients: await getClients() };
+  if (name === "get_clients") return { clients: await getClients() };
+  if (name === "find_free_slots") {
+    const slots = await findFreeSlots({
+      userId: ctx.userId,
+      date: String(args.date ?? ""),
+      durationMinutes: Number(args.duration_minutes) || undefined,
+      near: str(args.near),
+      limit: 6,
+    });
+    return { free_slots: slots, note: slots.length ? undefined : "No free slots of that length that day." };
   }
   throw new BookingError(`Unknown tool ${name}.`);
 }
 
-/** Checks a write without performing it and returns a one-line summary for the approval card. */
-export async function previewWriteTool(name: string, args: Args, ctx: Ctx): Promise<string> {
+/** Checks a write without performing it; returns the text for the approval card. */
+export async function previewWriteTool(name: string, args: Args, ctx: Ctx): Promise<{ summary: string; details: PendingDetails }> {
   if (name === "create_booking") {
     const c = await checkCreate(createInput(args, ctx));
-    return `Create booking: ${describeBooking({ clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) })}`;
+    const to = describeBooking({ clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) });
+    return { summary: `Create booking: ${to}`, details: { kind: "create", title: "New booking", to } };
   }
   if (name === "update_booking") {
     const c = await checkUpdate(updateInput(args, ctx));
-    const after = { clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) };
-    return `Change booking #${c.bookingId}: ${describeBooking(c.before)}  →  ${describeBooking(after)}`;
+    const from = describeBooking(c.before);
+    const to = describeBooking({ clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) });
+    return { summary: `Change booking #${c.bookingId}: ${from}  →  ${to}`, details: { kind: "update", title: `Change booking #${c.bookingId}`, from, to } };
   }
   if (name === "cancel_booking") {
-    const booking = await checkCancel({ userId: ctx.userId, bookingId: args.booking_id });
-    return `Cancel booking #${booking.id}: ${describeBooking(booking)}`;
+    const b = await checkCancel({ userId: ctx.userId, bookingId: args.booking_id });
+    const from = describeBooking(b);
+    return { summary: `Cancel booking #${b.id}: ${from}`, details: { kind: "cancel", title: `Cancel booking #${b.id}`, from } };
+  }
+  if (name === "undo_last_change") {
+    const plan = await checkUndo(ctx.userId);
+    return {
+      summary: `Undo: ${plan.description}`,
+      details: {
+        kind: "undo",
+        title: `Undo last change to booking #${plan.current.id}`,
+        from: plan.current.status === "cancelled" ? `Cancelled: ${describeBooking(plan.current)}` : describeBooking(plan.current),
+        to: plan.restored.status === "cancelled" ? `Cancelled: ${describeBooking(plan.restored)}` : describeBooking(plan.restored),
+      },
+    };
   }
   throw new BookingError(`Unknown tool ${name}.`);
 }
 
-/** Performs an approved write. Re-runs the same checks inside createBooking/updateBooking. */
-export async function runWriteTool(name: string, args: Args, ctx: Ctx): Promise<{ result: unknown; message: string; bookingId: number }> {
+/** Performs an approved write. The same checks run again inside, and an audit row is written. */
+export async function runWriteTool(name: string, args: Args, ctx: WriteCtx): Promise<{ result: unknown; message: string; bookingId: number }> {
+  const audit = { approvedBy: ctx.userId, source: ctx.source };
   if (name === "create_booking") {
-    const booking = await createBooking(createInput(args, ctx));
-    return {
-      result: { ok: true, booking },
-      message: `Done — booked ${describeBooking(booking)} (booking #${booking.id}).`,
-      bookingId: booking.id,
-    };
+    const booking = await createBooking(createInput(args, ctx), audit);
+    return { result: { ok: true, booking }, message: `Done — booked ${describeBooking(booking)} (booking #${booking.id}).`, bookingId: booking.id };
   }
   if (name === "update_booking") {
-    const { after } = await updateBooking(updateInput(args, ctx));
-    return {
-      result: { ok: true, booking: after },
-      message: `Done — booking #${after.id} is now ${describeBooking(after)}.`,
-      bookingId: after.id,
-    };
+    const { after } = await updateBooking(updateInput(args, ctx), audit);
+    return { result: { ok: true, booking: after }, message: `Done — booking #${after.id} is now ${describeBooking(after)}.`, bookingId: after.id };
   }
   if (name === "cancel_booking") {
-    const booking = await cancelBooking({ userId: ctx.userId, bookingId: args.booking_id });
+    const booking = await cancelBooking({ userId: ctx.userId, bookingId: args.booking_id }, audit);
     return {
       result: { ok: true, booking },
       message: `Done — cancelled booking #${booking.id} (${describeBooking(booking)}). The time slot is free again.`,
       bookingId: booking.id,
     };
+  }
+  if (name === "undo_last_change") {
+    const { plan, after } = await undoLastChange(ctx.userId, audit);
+    const message =
+      plan.event.action === "created"
+        ? `Done — undone: the new booking #${after.id} for ${after.clientName} is cancelled again.`
+        : plan.event.action === "cancelled"
+          ? `Done — undone: booking #${after.id} is restored (${describeBooking(after)}).`
+          : `Done — undone: booking #${after.id} is back to ${describeBooking(after)}.`;
+    return { result: { ok: true, undone: plan.description, booking: after }, message, bookingId: after.id };
   }
   throw new BookingError(`Unknown tool ${name}.`);
 }
