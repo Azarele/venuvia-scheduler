@@ -13,7 +13,7 @@ A single-page Next.js app where a salon user chats with an AI assistant that **r
 | Undo | Reverses the last change (repeat to step back). From the chat ("undo that") or the **Undo last change** button; still needs approval |
 | No double bookings, guaranteed | A Postgres **exclusion constraint** rejects overlapping confirmed bookings, even if two requests race |
 | Survives refreshes and restarts | Chat history and pending approvals are stored in Postgres |
-| Measured, not guessed | `npm run eval` scores the AI on 18 realistic requests |
+| Measured, not guessed | `npm run eval` scores the AI on 23 realistic requests, including multi-step follow-ups |
 
 Screenshots of the full flow (create → change → cancel → undo → activity log) are in [`docs/screenshots/`](docs/screenshots).
 
@@ -120,21 +120,21 @@ conversations    (user_id, history jsonb, bubbles jsonb, updated_at)
 
 ```bash
 npm test         # 15 end-to-end tests
-npm run eval     # scores the real AI on 18 realistic requests
+npm run eval     # scores the real AI on 23 realistic requests
 ```
 
 **Tests** run the real agent loop and real SQL against a separate **`venuvia_test`** database (created automatically; your data is never touched), with a fake AI that returns scripted tool calls. They cover the approval flow, audit rows, chat persistence, double-approve, moving on while a change waits, overlap suggestions, the database constraint, re-checks at approval, other users' bookings, cancel, multi-step undo, the Undo button, and undo refusing when a booking changed in between.
 
-**The eval** sends realistic phrasings to whichever AI is configured, such as *"Push Anna's haircut back by 30 minutes"*, *"Cancel tomorrow's 3pm"*, *"Book a client tomorrow at 2"* (it should ask who) and *"Book Ola at 3:30pm"* (a clash, so it should offer free times). It checks the tool and arguments the AI picks. It runs on a separate **`venuvia_eval`** database and never approves anything. The output looks like this (illustrative, not a real result):
+**The eval** sends realistic phrasings to whichever AI is configured, such as *"Push Anna's haircut back by 30 minutes"*, *"Cancel tomorrow's 3pm"*, *"Book a client tomorrow at 2"* (it should ask who) and *"Book Ola at 3:30pm"* (a clash, so it should offer free times). It checks the tool and arguments the AI picks. Five cases are multi-step: earlier messages are sent first and their changes approved or rejected, then a follow-up like *"Change it to 4pm"*, *"Actually, cancel that one"* or *"Undo that"* must hit the right booking. It runs on a separate **`venuvia_eval`** database, reset to the demo data before every case. The output looks like this (illustrative, not a real result):
 
 ```
-Eval: Gemini · gemini-flash-latest · 18 cases
+Eval: Gemini · gemini-flash-latest · 23 cases
 ✓  1. Create a booking for 2pm tomorrow under a random name  (2.1s)
 ✗  7. Push Anna's haircut back by 30 minutes  (3.4s)
       expected: update_booking #1 start 2026-11-03 10:30
       got:      update_booking {"booking_id":1,"start":"2026-11-03 10:00"}
 ...
-N/18 passed · avg X.Xs per message
+N/23 passed · avg X.Xs per message
 ```
 
 Run it with each model you're considering (`AI_PROVIDER` / `*_MODEL`) to pick the cheapest one that passes. `npm run eval -- julia` runs only matching cases, and `EVAL_DELAY_MS` spaces requests out for free-tier rate limits (default 4s). Each AI step is printed as it happens. A request that gets no answer within `AI_TIMEOUT_MS` (default 60s) fails with a clear message instead of hanging, and an overloaded (503) or rate-limited (429) response is retried once.

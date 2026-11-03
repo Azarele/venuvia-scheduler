@@ -4,8 +4,9 @@
 //   npm run eval              run all cases
 //   npm run eval -- julia     only cases whose text contains "julia"
 //
-// Runs against a separate database (venuvia_eval) reset to the demo data, and never
-// approves anything, so it can't change your bookings. Each case starts a fresh chat.
+// Runs against a separate database (venuvia_eval), so it can't change your bookings.
+// Every case starts from fresh demo data and a fresh chat. Multi-step cases first send
+// earlier messages (approving or rejecting their changes), then check the last reply.
 import { DateTime } from "luxon";
 import { resetDatabase, useIsolatedDatabase } from "./isolated-db.ts";
 
@@ -13,12 +14,13 @@ await useIsolatedDatabase("eval");
 const { pool } = await import("../src/lib/db.ts");
 const { runAgent, resolvePending } = await import("../src/lib/ai/agent.ts");
 const { getProvider, ProviderError } = await import("../src/lib/ai/providers.ts");
-const { clearConversation } = await import("../src/lib/conversation.ts");
 const { now } = await import("../src/lib/time.ts");
 
 type Args = Record<string, unknown>;
 type Outcome = { write?: { tool: string; args: Args; error?: string }; reads: string[]; pending: boolean; reply: string };
-type Case = { say: string; expect: string; check: (o: Outcome) => boolean };
+/** An earlier message in a multi-step case, and what to do with the change it proposes. */
+type Step = { say: string; then: "approve" | "reject" | "nothing" };
+type Case = { say: string; expect: string; check: (o: Outcome) => boolean; before?: Step[] };
 
 const USER = 1; // Ewa: Anna 10:00 (#1), Marta 11:00 (#2), Julia 15:00 (#3), all tomorrow
 const day = (d: DateTime) => d.toFormat("yyyy-MM-dd");
@@ -75,10 +77,43 @@ const CASES: Case[] = [
   },
   { say: "Book a client tomorrow at 2", expect: "asks who the client is (no card)", check: (o) => noChange(o) && !o.write && /\?/.test(o.reply) },
   { say: "Delete everything", expect: "no change proposed", check: (o) => noChange(o) },
+
+  // Multi-step: follow-ups that depend on what happened earlier in the chat.
+  // The demo data has bookings #1–#4, so the first new booking is #5.
+  {
+    before: [{ say: "Book Ola tomorrow at 2pm", then: "approve" }],
+    say: "Change it to 4pm",
+    expect: `update_booking #5 (Ola) start ${T} 16:00`,
+    check: (o) => at(o, "update_booking") && arg(o, "booking_id") === "5" && arg(o, "start") === `${T} 16:00`,
+  },
+  {
+    before: [{ say: "Book Ola tomorrow at 2pm", then: "approve" }],
+    say: "Actually, cancel that one",
+    expect: "cancel_booking #5 (the booking just made)",
+    check: (o) => at(o, "cancel_booking") && arg(o, "booking_id") === "5",
+  },
+  {
+    before: [{ say: "Move Julia to 5pm", then: "approve" }],
+    say: "Undo that",
+    expect: "undo_last_change with an approval card",
+    check: (o) => at(o, "undo_last_change") && o.pending,
+  },
+  {
+    before: [{ say: "Book Ola tomorrow at 2pm", then: "reject" }],
+    say: "OK, make it 6pm instead",
+    expect: `create_booking Ola ${T} 18:00`,
+    check: (o) => at(o, "create_booking") && /ola/i.test(arg(o, "client_name")) && arg(o, "start") === `${T} 18:00`,
+  },
+  {
+    before: [{ say: "Book Ola tomorrow at 3:30pm", then: "nothing" }],
+    say: "OK, take the first free time you suggested",
+    expect: "create_booking Ola at a free time (not 15:30) with an approval card",
+    check: (o) => at(o, "create_booking") && /ola/i.test(arg(o, "client_name")) && arg(o, "start").startsWith(T) && arg(o, "start") !== `${T} 15:30` && o.pending,
+  },
 ];
 
 const filter = process.argv.slice(2).join(" ").toLowerCase();
-const cases = CASES.filter((c) => !filter || c.say.toLowerCase().includes(filter));
+const cases = CASES.filter((c) => !filter || [c.say, ...(c.before ?? []).map((b) => b.say)].some((t) => t.toLowerCase().includes(filter)));
 const delayMs = Number(process.env.EVAL_DELAY_MS ?? 4000); // free tiers allow only a few requests per minute
 const baseProvider = getProvider();
 // Wraps the provider to print each AI step live, so a slow or stuck request is visible.
@@ -100,7 +135,18 @@ const provider = {
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-await resetDatabase(pool);
+/** Sends one message; if the AI is overloaded or times out, waits and retries once. */
+async function ask(text: string) {
+  try {
+    return await runAgent({ userId: USER, text, provider });
+  } catch (error) {
+    if (!(error instanceof ProviderError) || !/429|503|didn't respond/.test(error.message)) throw error;
+    console.log(`      (${error.message.slice(0, 80)} — waiting 30s and retrying once)`);
+    await sleep(30_000);
+    return runAgent({ userId: USER, text, provider });
+  }
+}
+
 console.log(`\nEval: ${provider.name} · ${provider.model} · ${cases.length} cases · timeout ${(Number(process.env.AI_TIMEOUT_MS) || 60_000) / 1000}s per AI request · today is ${now().toFormat("ccc yyyy-MM-dd")}\n`);
 
 let passed = 0;
@@ -108,21 +154,19 @@ let totalMs = 0;
 const failures: string[] = [];
 for (const [i, c] of cases.entries()) {
   if (i > 0) await sleep(delayMs);
-  await clearConversation(USER);
-  console.log(`${String(i + 1).padStart(2)}/${cases.length}  ${c.say}`);
+  await resetDatabase(pool); // fresh demo data (and an empty chat) for every case
+  const label = [...(c.before ?? []).map((b) => `${b.say} [${b.then === "nothing" ? "no card expected" : b.then}]`), c.say].join("  →  ");
+  console.log(`${String(i + 1).padStart(2)}/${cases.length}  ${label}`);
   const started = Date.now();
   let outcome: Outcome;
   try {
-    let res;
-    try {
-      res = await runAgent({ userId: USER, text: c.say, provider });
-    } catch (error) {
-      if (!(error instanceof ProviderError) || !/429|503|didn't respond/.test(error.message)) throw error;
-      console.log(`      (${error.message.slice(0, 80)} — waiting 30s and retrying once)`);
-      await sleep(30_000);
-      await clearConversation(USER);
-      res = await runAgent({ userId: USER, text: c.say, provider });
+    for (const step of c.before ?? []) {
+      const res = await ask(step.say);
+      if (step.then === "nothing") continue;
+      if (!res.pending) throw new Error(`setup step "${step.say}" didn't propose a change: ${(res.reply ?? "").slice(0, 80)}`);
+      await resolvePending({ userId: USER, pendingId: res.pending.id, approved: step.then === "approve" });
     }
+    const res = await ask(c.say);
     const write = res.events.find((e) => e.kind === "write");
     outcome = {
       write: write && { tool: write.tool, args: write.args, error: write.error },

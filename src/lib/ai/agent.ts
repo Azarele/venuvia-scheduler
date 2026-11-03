@@ -5,6 +5,7 @@
 //      loop stops. Nothing is written until the user clicks Approve (resolvePending).
 // The conversation and pending actions are stored in Postgres (see conversation.ts).
 import { randomUUID } from "node:crypto";
+import type { DateTime } from "luxon";
 import { BookingError, BUSINESS_HOURS, getClients, getUser, type User } from "../bookings.ts";
 import type { Bubble, PendingAction, ToolEvent } from "../chat-types.ts";
 import {
@@ -36,6 +37,8 @@ async function systemPrompt(user: User): Promise<string> {
   return `You are the booking assistant for Studio Nova, a beauty salon. You are talking to ${user.name} (user id ${user.id}), who manages their own bookings through you.
 
 Current local time: ${today.toFormat("cccc yyyy-MM-dd HH:mm")} (${TIMEZONE}). Tomorrow is ${today.plus({ days: 1 }).toFormat("cccc yyyy-MM-dd")}.
+Next 14 days: ${calendar(today)}.
+Take dates from this list instead of calculating them. A weekday on its own ("Friday", "next Friday") means the first one after today.
 Opening hours: ${BUSINESS_HOURS.open}–${BUSINESS_HOURS.close}.
 Existing clients: ${clients.join(", ") || "none"}.
 
@@ -51,6 +54,14 @@ How to work:
 - If a tool returns any other error, explain it briefly and suggest what to do.
 - If asked for a random client name, invent a plausible first name that is NOT one of the existing clients.
 - Keep replies short. List bookings one per line as "#id Client — Day date, time–time".`;
+}
+
+/** "Tue 2026-11-03 (today), Wed 2026-11-04 (tomorrow), Thu 2026-11-05, …" so the AI never does date maths. */
+function calendar(today: DateTime): string {
+  return Array.from({ length: 14 }, (_, i) => {
+    const d = today.plus({ days: i });
+    return `${d.toFormat("ccc yyyy-MM-dd")}${i === 0 ? " (today)" : i === 1 ? " (tomorrow)" : ""}`;
+  }).join(", ");
 }
 
 const bubble = (b: Omit<Bubble, "id" | "at">): Bubble => ({ id: randomUUID(), at: new Date().toISOString(), ...b });
