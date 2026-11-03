@@ -8,7 +8,7 @@ const globalForDb = globalThis as unknown as { pgPool?: pg.Pool };
 function getPool(): pg.Pool {
   return (globalForDb.pgPool ??= new pg.Pool({
     connectionString: process.env.DATABASE_URL ?? "postgres://venuvia:venuvia@localhost:5432/venuvia",
-    max: 5,
+    max: 10, // one per in-flight chat request holds a conversation lock
   }));
 }
 

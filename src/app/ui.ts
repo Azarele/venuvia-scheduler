@@ -11,6 +11,37 @@ export async function api<T>(url: string, init?: { method?: string; body?: unkno
   return data as T;
 }
 
+/**
+ * Calls the streaming chat endpoint: calls `onProgress` for each status line while the
+ * assistant works, and resolves with the final result (or throws its error).
+ */
+export async function streamChat<T>(body: unknown, onProgress: (label: string) => void): Promise<T> {
+  const res = await fetch("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok || !res.body) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? `Request failed (${res.status})`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const message = JSON.parse(line);
+      if (message.type === "progress") onProgress(message.label);
+      else if (message.type === "error") throw new Error(message.error);
+      else if (message.type === "done") return message as T;
+    }
+  }
+  throw new Error("The connection closed before the assistant finished.");
+}
+
 /** "2026-11-03" relative to today ("2026-11-02") -> "Tomorrow". Both are salon-local dates. */
 export function relativeDayLabel(date: string, today: string): string {
   const diff = Math.round((Date.parse(`${date}T12:00:00Z`) - Date.parse(`${today}T12:00:00Z`)) / 86_400_000);

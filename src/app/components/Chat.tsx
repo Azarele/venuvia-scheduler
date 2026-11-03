@@ -28,7 +28,9 @@ export function Chat(props: {
   timezone: string;
   bubbles: Bubble[];
   busy: boolean;
+  progress: string | null;
   onSend: (text: string) => void;
+  onRetry: (text: string) => void;
   onDecide: (pending: PendingAction, approved: boolean) => void;
 }) {
   const { bubbles, busy } = props;
@@ -90,7 +92,15 @@ export function Chat(props: {
               )}
               {b.text && <div className={`bubble${b.done ? " done" : ""}`}>{formatText(b.text)}</div>}
               {b.pending && <ApprovalCard pending={b.pending} decision={b.decision} busy={busy} onDecide={props.onDecide} />}
-              <div className="time">{clockTime(b.at, props.timezone)}</div>
+              {b.role === "error" && b.retryText && b.id === bubbles.at(-1)?.id && (
+                <button className="retry" onClick={() => props.onRetry(b.retryText!)} disabled={busy}>
+                  ↻ Retry
+                </button>
+              )}
+              <div className="time">
+                {clockTime(b.at, props.timezone)}
+                {b.usage && <span title={`${b.usage.model}: ${b.usage.inputTokens} input + ${b.usage.outputTokens} output tokens`}> · {usageLabel(b.usage)}</span>}
+              </div>
             </div>
           </div>
         ))}
@@ -98,10 +108,13 @@ export function Chat(props: {
         {busy && (
           <div className="msg assistant">
             <div className="avatar">AI</div>
-            <div className="bubble typing" aria-label="Assistant is thinking">
-              <span />
-              <span />
-              <span />
+            <div className="bubble typing" aria-live="polite">
+              <span className="dots">
+                <span />
+                <span />
+                <span />
+              </span>
+              {props.progress && <span className="progress">{props.progress}</span>}
             </div>
           </div>
         )}
@@ -149,11 +162,26 @@ export function Chat(props: {
 
 const KIND_ICON = { create: "+", update: "↻", cancel: "✕", undo: "↶" } as const;
 
+/** Card labels follow the conversation's language (the card text itself comes from the server). */
+const CARD_TEXT = {
+  en: { from: "From", to: "To", booking: "Booking", approved: "Approved", rejected: "Rejected", failed: "Couldn't apply", open: "Needs your approval", approve: "Approve", approveCancel: "Approve cancellation", reject: "Reject" },
+  pl: { from: "Z", to: "Na", booking: "Rezerwacja", approved: "Zatwierdzono", rejected: "Odrzucono", failed: "Nie udało się", open: "Wymaga zatwierdzenia", approve: "Zatwierdź", approveCancel: "Zatwierdź odwołanie", reject: "Odrzuć" },
+};
+
+function usageLabel(u: NonNullable<Bubble["usage"]>): string {
+  const tokens = u.inputTokens + u.outputTokens;
+  const k = tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
+  const cost = u.costUsd == null ? "" : ` · $${u.costUsd < 0.01 ? u.costUsd.toFixed(4) : u.costUsd.toFixed(3)}`;
+  const calls = `${u.calls} AI call${u.calls === 1 ? "" : "s"}`;
+  return tokens ? `${calls} · ${k} tokens${cost}` : calls; // the scripted stand-in reports no tokens
+}
+
 function ApprovalCard(props: { pending: PendingAction; decision?: Bubble["decision"]; busy: boolean; onDecide: (p: PendingAction, approved: boolean) => void }) {
   const { pending, decision } = props;
   const d = pending.details;
+  const t = CARD_TEXT[d.lang ?? "en"];
   const danger = d.kind === "cancel";
-  const status = decision === "approved" ? "Approved" : decision === "rejected" ? "Rejected" : decision === "failed" ? "Couldn't apply" : "Needs your approval";
+  const status = decision === "approved" ? t.approved : decision === "rejected" ? t.rejected : decision === "failed" ? t.failed : t.open;
   return (
     <div className={`approval ${d.kind} ${decision ?? "open"}`}>
       <div className="approval-head">
@@ -164,13 +192,13 @@ function ApprovalCard(props: { pending: PendingAction; decision?: Bubble["decisi
       <div className="approval-rows">
         {d.from && (
           <div className="row">
-            <span className="label">{d.to ? "From" : d.kind === "cancel" ? "Booking" : ""}</span>
+            <span className="label">{d.to ? t.from : t.booking}</span>
             <span className={d.kind === "cancel" ? "strike" : ""}>{d.from}</span>
           </div>
         )}
         {d.to && (
           <div className="row">
-            <span className="label">{d.from ? "To" : "Booking"}</span>
+            <span className="label">{d.from ? t.to : t.booking}</span>
             <span className="strong">{d.to}</span>
           </div>
         )}
@@ -178,10 +206,10 @@ function ApprovalCard(props: { pending: PendingAction; decision?: Bubble["decisi
       {!decision && (
         <div className="approval-actions">
           <button className={danger ? "danger" : "primary"} disabled={props.busy} onClick={() => props.onDecide(pending, true)}>
-            {danger ? "Approve cancellation" : "Approve"}
+            {danger ? t.approveCancel : t.approve}
           </button>
           <button className="ghost" disabled={props.busy} onClick={() => props.onDecide(pending, false)}>
-            Reject
+            {t.reject}
           </button>
         </div>
       )}

@@ -3,6 +3,7 @@
 // can relay), then changes the booking AND writes an audit row in one transaction.
 import type pg from "pg";
 import { pool } from "./db.ts";
+import type { Lang } from "./lang.ts";
 import { formatDay, formatLocal, formatTime, now, parseLocal } from "./time.ts";
 
 export class BookingError extends Error {}
@@ -218,6 +219,7 @@ type CheckedUpdate = CheckedCreate & { bookingId: number; before: Booking };
 export async function checkCreate(input: CreateInput): Promise<CheckedCreate> {
   const clientName = cleanName(input.clientName);
   const { start, end } = checkTimes(input.start, input.end, DEFAULT_DURATION_MINUTES);
+  await checkOpeningHours(input.userId, start, end);
   await checkNoOverlap(input.userId, start, end);
   return { userId: input.userId, clientName, start, end, service: cleanService(input.service) };
 }
@@ -238,6 +240,7 @@ export async function checkUpdate(input: UpdateInput): Promise<CheckedUpdate> {
     hasEnd ? input.end : hasStart ? undefined : before.end,
     oldMinutes,
   );
+  await checkOpeningHours(input.userId, start, end, bookingId);
   await checkNoOverlap(input.userId, start, end, bookingId);
   return {
     bookingId,
@@ -457,10 +460,31 @@ async function checkNoOverlap(userId: number, start: Date, end: Date, ignoreBook
     limit: 3,
     ignoreBookingId,
   });
-  const hint = free.length
+  throw new BookingError(`That overlaps an existing booking (${clash}).${freeTimesHint(free)}`);
+}
+
+/** Bookings must start and end within opening hours on the same day. */
+async function checkOpeningHours(userId: number, start: Date, end: Date, ignoreBookingId?: number) {
+  const startLocal = formatLocal(start);
+  const endLocal = formatLocal(end);
+  const date = startLocal.slice(0, 10);
+  const inside = endLocal.slice(0, 10) === date && startLocal.slice(11) >= BUSINESS_HOURS.open && endLocal.slice(11) <= BUSINESS_HOURS.close;
+  if (inside) return;
+  const free = await findFreeSlots({
+    userId,
+    date,
+    durationMinutes: (end.getTime() - start.getTime()) / 60_000,
+    near: startLocal.slice(11),
+    limit: 3,
+    ignoreBookingId,
+  });
+  throw new BookingError(`That's outside opening hours (${BUSINESS_HOURS.open}–${BUSINESS_HOURS.close}).${freeTimesHint(free)}`);
+}
+
+function freeTimesHint(free: { start: string }[]): string {
+  return free.length
     ? ` Nearest free times that day: ${free.map((s) => s.start.slice(11)).join(", ")}.`
     : " There are no free slots of that length that day.";
-  throw new BookingError(`That overlaps an existing booking (${clash}).${hint}`);
 }
 
 async function findOrCreateClient(db: pg.PoolClient, name: string): Promise<number> {
@@ -477,8 +501,8 @@ function pick(b: Booking) {
   return { clientName: b.clientName, service: b.service, start: b.start, end: b.end, status: b.status };
 }
 
-export function describeBooking(b: { clientName: string; start: string; end: string; service?: string | null }): string {
+export function describeBooking(b: { clientName: string; start: string; end: string; service?: string | null }, lang: Lang = "en"): string {
   const start = parseLocal(b.start)!.toJSDate();
   const end = parseLocal(b.end)!.toJSDate();
-  return `${b.clientName}${b.service ? ` (${b.service})` : ""}, ${formatDay(start)}, ${formatTime(start)}–${formatTime(end)}`;
+  return `${b.clientName}${b.service ? ` (${b.service})` : ""}, ${formatDay(start, lang)}, ${formatTime(start)}–${formatTime(end)}`;
 }

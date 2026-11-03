@@ -2,6 +2,7 @@
 // OpenAI chat format (which Gemini and OpenRouter both speak); the Claude adapter
 // converts to and from Anthropic's format. Switching provider = changing AI_PROVIDER.
 import Anthropic from "@anthropic-ai/sdk";
+import type { Usage } from "./pricing.ts";
 import type { ToolDef } from "./tools.ts";
 
 export type ToolCall = {
@@ -17,6 +18,8 @@ export type AssistantMessage = {
   tool_calls?: ToolCall[];
   /** Claude's raw content blocks, replayed verbatim on the next request. */
   anthropicContent?: unknown[];
+  /** Tokens this request used (not stored in the conversation). */
+  usage?: Usage;
 };
 
 export type ChatMessage =
@@ -123,14 +126,17 @@ export function openAICompatible(opts: { name: string; baseUrl: string; apiKey: 
         id: call.id || `call_${Date.now()}_${i}`,
         type: "function",
       }));
-      return { role: "assistant", content: message.content || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
+      // total - prompt also counts "thinking" tokens, which are billed as output.
+      const u = data.usage;
+      const usage = u ? { inputTokens: u.prompt_tokens ?? 0, outputTokens: (u.total_tokens ?? 0) - (u.prompt_tokens ?? 0) || (u.completion_tokens ?? 0) } : undefined;
+      return { role: "assistant", content: message.content || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}), usage };
     },
   };
 }
 
 function withoutPrivateFields(message: ChatMessage) {
   if (message.role !== "assistant") return message;
-  const { anthropicContent: _ignored, ...rest } = message;
+  const { anthropicContent: _ignored, usage: _usage, ...rest } = message;
   return rest;
 }
 
@@ -168,6 +174,10 @@ function anthropic(opts: { apiKey: string; model: string }): Provider {
         content: text || null,
         ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         anthropicContent: response.content,
+        usage: {
+          inputTokens: response.usage.input_tokens + (response.usage.cache_read_input_tokens ?? 0) + (response.usage.cache_creation_input_tokens ?? 0),
+          outputTokens: response.usage.output_tokens,
+        },
       };
     },
   };
@@ -199,6 +209,8 @@ function toAnthropicMessages(messages: ChatMessage[]) {
 // Only for testing the app without an API key: AI_PROVIDER=scripted. It handles
 // the three demo requests with simple pattern matching — it is NOT an AI.
 
+const simulatedFailures = new Set<string>();
+
 function scripted(): Provider {
   const NAMES = ["Ola", "Zofia", "Maja", "Lena", "Hanna", "Nina"];
   const call = (name: string, args: unknown): AssistantMessage => ({
@@ -225,6 +237,12 @@ function scripted(): Provider {
       const last = messages[messages.length - 1];
       const wantsChange = /\b(change|move|reschedule|update)\b/.test(lastUser);
       const wantsCancel = /\bcancel\b/.test(lastUser);
+
+      // For testing the Retry button: the first time, pretend the AI timed out.
+      if (lastUser.includes("simulate a timeout") && !simulatedFailures.has(lastUser)) {
+        simulatedFailures.add(lastUser);
+        throw new ProviderError("Scripted demo: simulated AI timeout (didn't respond within 60s). Click Retry.");
+      }
 
       if (last.role === "tool") {
         const data = JSON.parse(last.content);

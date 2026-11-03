@@ -1,8 +1,12 @@
 // AI eval: sends realistic requests to the configured AI (AI_PROVIDER in .env.local)
 // and checks that it picks the right tool with the right arguments.
 //
-//   npm run eval              run all cases
-//   npm run eval -- julia     only cases whose text contains "julia"
+//   npm run eval                    run all cases once
+//   npm run eval -- julia           only cases whose text contains "julia"
+//   npm run eval -- --runs 3        run every case 3 times and report how consistent it is
+//
+// It also reports tokens and cost per message (cost for models with a known price,
+// see src/lib/ai/pricing.ts).
 //
 // Runs against a separate database (venuvia_eval), so it can't change your bookings.
 // Every case starts from fresh demo data and a fresh chat. Multi-step cases first send
@@ -10,6 +14,7 @@
 import { DateTime } from "luxon";
 import { resetDatabase, useIsolatedDatabase } from "./isolated-db.ts";
 
+process.env.AI_USAGE_LOG = "0"; // the eval prints its own usage summary
 await useIsolatedDatabase("eval");
 const { pool } = await import("../src/lib/db.ts");
 const { runAgent, resolvePending } = await import("../src/lib/ai/agent.ts");
@@ -18,6 +23,7 @@ const { now } = await import("../src/lib/time.ts");
 
 type Args = Record<string, unknown>;
 type Outcome = { write?: { tool: string; args: Args; error?: string }; reads: string[]; pending: boolean; reply: string };
+type Usage = { calls: number; inputTokens: number; outputTokens: number; costUsd: number | null };
 /** An earlier message in a multi-step case, and what to do with the change it proposes. */
 type Step = { say: string; then: "approve" | "reject" | "nothing" };
 type Case = { say: string; expect: string; check: (o: Outcome) => boolean; before?: Step[] };
@@ -33,6 +39,7 @@ const nextWeekday = (weekday: number) => {
 const at = (o: Outcome, tool: string) => o.write?.tool === tool;
 const arg = (o: Outcome, key: string) => String(o.write?.args[key] ?? "");
 const noChange = (o: Outcome) => !o.pending;
+const polishReply = (o: Outcome) => /[ąćęłńóśźż]|\b(jutro|wizyt\w*|rezerwacj\w*|termin\w*|godzin\w*)\b/i.test(o.reply);
 
 const CASES: Case[] = [
   {
@@ -110,25 +117,52 @@ const CASES: Case[] = [
     expect: "create_booking Ola at a free time (not 15:30) with an approval card",
     check: (o) => at(o, "create_booking") && /ola/i.test(arg(o, "client_name")) && arg(o, "start").startsWith(T) && arg(o, "start") !== `${T} 15:30` && o.pending,
   },
+
+  // Opening hours (09:00–19:00).
+  {
+    say: "Book Ola tomorrow at 8pm",
+    expect: "outside opening hours → no card, reply offers a time within hours",
+    check: (o) => noChange(o) && /\b\d{1,2}[:.]\d{2}\b|\b\d{1,2}\s*(am|pm)\b/i.test(o.reply),
+  },
+
+  // Polish (Venuvia's users write Polish): right tool, and the reply is in Polish.
+  {
+    say: "Zarezerwuj Olę jutro na 14:00",
+    expect: `create_booking Ola ${T} 14:00`,
+    check: (o) => at(o, "create_booking") && /^ol/i.test(arg(o, "client_name")) && arg(o, "start") === `${T} 14:00`,
+  },
+  { say: "Przełóż Julię na 17:00", expect: `update_booking #3 start ${T} 17:00`, check: (o) => at(o, "update_booking") && arg(o, "booking_id") === "3" && arg(o, "start") === `${T} 17:00` },
+  { say: "Odwołaj jutrzejszą wizytę o 15", expect: "cancel_booking #3 (Julia)", check: (o) => at(o, "cancel_booking") && arg(o, "booking_id") === "3" },
+  { say: "Jakie mam jutro wizyty?", expect: "get_bookings, no change, reply in Polish", check: (o) => o.reads.includes("get_bookings") && !o.write && polishReply(o) },
+  {
+    before: [{ say: "Zarezerwuj Olę jutro na 14:00", then: "approve" }],
+    say: "Zmień na 16:00",
+    expect: `update_booking #5 start ${T} 16:00`,
+    check: (o) => at(o, "update_booking") && arg(o, "booking_id") === "5" && arg(o, "start") === `${T} 16:00`,
+  },
 ];
 
-const filter = process.argv.slice(2).join(" ").toLowerCase();
+const argv = process.argv.slice(2);
+const runsFlag = argv.findIndex((a) => a === "--runs" || a.startsWith("--runs="));
+const runs = Math.max(1, runsFlag < 0 ? 1 : Number(argv[runsFlag].split("=")[1] ?? argv[runsFlag + 1]) || 1);
+const filter = argv.filter((a, i) => !a.startsWith("--") && !(runsFlag >= 0 && i === runsFlag + 1)).join(" ").toLowerCase();
 const cases = CASES.filter((c) => !filter || [c.say, ...(c.before ?? []).map((b) => b.say)].some((t) => t.toLowerCase().includes(filter)));
 const delayMs = Number(process.env.EVAL_DELAY_MS ?? 4000); // free tiers allow only a few requests per minute
+const verbose = runs === 1; // with several runs, print one compact line per case
 const baseProvider = getProvider();
 // Wraps the provider to print each AI step live, so a slow or stuck request is visible.
 const provider = {
   ...baseProvider,
   async complete(request: Parameters<typeof baseProvider.complete>[0]) {
     const started = Date.now();
-    process.stdout.write(`      · asking ${baseProvider.name}… `);
+    if (verbose) process.stdout.write(`      · asking ${baseProvider.name}… `);
     try {
       const reply = await baseProvider.complete(request);
       const calls = reply.tool_calls?.map((c) => c.function.name).join(", ");
-      process.stdout.write(`${calls ? `→ ${calls}` : "→ text reply"} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
+      if (verbose) process.stdout.write(`${calls ? `→ ${calls}` : "→ text reply"} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
       return reply;
     } catch (error) {
-      process.stdout.write(`failed after ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+      if (verbose) process.stdout.write(`failed after ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
       throw error;
     }
   },
@@ -143,57 +177,95 @@ async function ask(text: string) {
     if (!(error instanceof ProviderError) || !/429|503|didn't respond/.test(error.message)) throw error;
     console.log(`      (${error.message.slice(0, 80)} — waiting 30s and retrying once)`);
     await sleep(30_000);
-    return runAgent({ userId: USER, text, provider });
+    return runAgent({ userId: USER, text, provider, retry: true });
   }
 }
 
-console.log(`\nEval: ${provider.name} · ${provider.model} · ${cases.length} cases · timeout ${(Number(process.env.AI_TIMEOUT_MS) || 60_000) / 1000}s per AI request · today is ${now().toFormat("ccc yyyy-MM-dd")}\n`);
-
-let passed = 0;
-let totalMs = 0;
-const failures: string[] = [];
-for (const [i, c] of cases.entries()) {
-  if (i > 0) await sleep(delayMs);
+/** Runs one case once from fresh data. Returns the outcome, the time taken and the usage of every message sent. */
+async function runCase(c: Case): Promise<{ outcome: Outcome; ms: number; usages: Usage[] }> {
   await resetDatabase(pool); // fresh demo data (and an empty chat) for every case
-  const label = [...(c.before ?? []).map((b) => `${b.say} [${b.then === "nothing" ? "no card expected" : b.then}]`), c.say].join("  →  ");
-  console.log(`${String(i + 1).padStart(2)}/${cases.length}  ${label}`);
+  const usages: Usage[] = [];
   const started = Date.now();
-  let outcome: Outcome;
   try {
     for (const step of c.before ?? []) {
       const res = await ask(step.say);
+      if (res.usage) usages.push(res.usage);
       if (step.then === "nothing") continue;
       if (!res.pending) throw new Error(`setup step "${step.say}" didn't propose a change: ${(res.reply ?? "").slice(0, 80)}`);
       await resolvePending({ userId: USER, pendingId: res.pending.id, approved: step.then === "approve" });
     }
     const res = await ask(c.say);
+    if (res.usage) usages.push(res.usage);
     const write = res.events.find((e) => e.kind === "write");
-    outcome = {
-      write: write && { tool: write.tool, args: write.args, error: write.error },
-      reads: res.events.filter((e) => e.kind === "read").map((e) => e.tool),
-      pending: Boolean(res.pending),
-      reply: res.reply ?? "",
+    if (res.pending) await resolvePending({ userId: USER, pendingId: res.pending.id, approved: false }); // never apply the case itself
+    return {
+      outcome: {
+        write: write && { tool: write.tool, args: write.args, error: write.error },
+        reads: res.events.filter((e) => e.kind === "read").map((e) => e.tool),
+        pending: Boolean(res.pending),
+        reply: res.reply ?? "",
+      },
+      ms: Date.now() - started,
+      usages,
     };
-    if (res.pending) await resolvePending({ userId: USER, pendingId: res.pending.id, approved: false }); // never change data
   } catch (error) {
-    outcome = { reads: [], pending: false, reply: `ERROR: ${(error as Error).message}` };
-  }
-  const ms = Date.now() - started;
-  totalMs += ms;
-  const ok = c.check(outcome);
-  if (ok) passed++;
-  const did = outcome.write
-    ? `${outcome.write.tool} ${JSON.stringify(outcome.write.args)}${outcome.write.error ? ` → refused: ${outcome.write.error.slice(0, 60)}` : ""}`
-    : `${outcome.reads.join(", ") || "no tools"} → "${outcome.reply.replace(/\s+/g, " ").slice(0, 80)}"`;
-  console.log(`      ${ok ? "✓ pass" : "✗ FAIL"} (${(ms / 1000).toFixed(1)}s)`);
-  if (!ok) {
-    console.log(`        expected: ${c.expect}\n        got:      ${did}`);
-    failures.push(c.say);
+    return { outcome: { reads: [], pending: false, reply: `ERROR: ${(error as Error).message}` }, ms: Date.now() - started, usages };
   }
 }
 
-const pct = cases.length ? Math.round((passed / cases.length) * 100) : 0;
-console.log(`\n${passed}/${cases.length} passed (${pct}%) · avg ${(totalMs / Math.max(cases.length, 1) / 1000).toFixed(1)}s per message (incl. tool round trips)`);
-if (failures.length) console.log(`Failed: ${failures.map((f) => `"${f}"`).join(", ")}`);
+const describe = (o: Outcome) =>
+  o.write
+    ? `${o.write.tool} ${JSON.stringify(o.write.args)}${o.write.error ? ` → refused: ${o.write.error.slice(0, 60)}` : ""}`
+    : `${o.reads.join(", ") || "no tools"} → "${o.reply.replace(/\s+/g, " ").slice(0, 80)}"`;
+
+console.log(
+  `\nEval: ${provider.name} · ${provider.model} · ${cases.length} cases${runs > 1 ? ` × ${runs} runs` : ""} · timeout ${(Number(process.env.AI_TIMEOUT_MS) || 60_000) / 1000}s per AI request · today is ${now().toFormat("ccc yyyy-MM-dd")}\n`,
+);
+
+let totalPasses = 0;
+let totalMs = 0;
+const allUsages: Usage[] = [];
+const alwaysPass: string[] = [];
+const flaky: string[] = [];
+const alwaysFail: string[] = [];
+let first = true;
+for (const [i, c] of cases.entries()) {
+  const label = [...(c.before ?? []).map((b) => `${b.say} [${b.then === "nothing" ? "no card expected" : b.then}]`), c.say].join("  →  ");
+  console.log(`${String(i + 1).padStart(2)}/${cases.length}  ${label}`);
+  const marks: string[] = [];
+  let lastFailure: Outcome | null = null;
+  for (let r = 0; r < runs; r++) {
+    if (!first) await sleep(delayMs);
+    first = false;
+    const { outcome, ms, usages } = await runCase(c);
+    totalMs += ms;
+    allUsages.push(...usages);
+    const ok = c.check(outcome);
+    if (ok) totalPasses++;
+    else lastFailure = outcome;
+    marks.push(ok ? "✓" : "✗");
+    if (verbose) console.log(`      ${ok ? "✓ pass" : "✗ FAIL"} (${(ms / 1000).toFixed(1)}s)`);
+  }
+  const passes = marks.filter((m) => m === "✓").length;
+  if (!verbose) console.log(`      ${marks.join(" ")}  (${passes}/${runs})`);
+  if (lastFailure) console.log(`        expected: ${c.expect}\n        got:      ${describe(lastFailure)}`);
+  (passes === runs ? alwaysPass : passes === 0 ? alwaysFail : flaky).push(c.say);
+}
+
+const caseRuns = cases.length * runs;
+const pct = caseRuns ? Math.round((totalPasses / caseRuns) * 100) : 0;
+console.log(`\n${totalPasses}/${caseRuns} passed (${pct}%) · avg ${(totalMs / Math.max(caseRuns, 1) / 1000).toFixed(1)}s per case (incl. tool round trips)`);
+if (runs > 1) console.log(`Always passed: ${alwaysPass.length}/${cases.length}${flaky.length ? ` · flaky: ${flaky.map((f) => `"${f}"`).join(", ")}` : ""}`);
+if (alwaysFail.length) console.log(`Always failed: ${alwaysFail.map((f) => `"${f}"`).join(", ")}`);
+
+if (allUsages.length) {
+  const sum = (k: "calls" | "inputTokens" | "outputTokens") => allUsages.reduce((n, u) => n + u[k], 0);
+  const n = allUsages.length;
+  const costs = allUsages.map((u) => u.costUsd);
+  const cost = costs.every((c) => c != null) ? `~$${((costs as number[]).reduce((a, b) => a + b, 0) / n).toFixed(5)} per message` : "cost n/a (no price for this model; set AI_PRICE_INPUT / AI_PRICE_OUTPUT, USD per million tokens)";
+  console.log(
+    `Per message (avg of ${n}): ${(sum("calls") / n).toFixed(1)} AI calls · ${Math.round(sum("inputTokens") / n).toLocaleString("en-US")} input + ${Math.round(sum("outputTokens") / n).toLocaleString("en-US")} output tokens · ${cost}`,
+  );
+}
 await pool.end();
-process.exitCode = failures.length ? 1 : 0;
+process.exitCode = flaky.length || alwaysFail.length ? 1 : 0;

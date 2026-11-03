@@ -4,6 +4,7 @@ export type ToolEvent = { tool: string; kind: "read" | "write"; args: Record<str
 
 export type PendingDetails = {
   kind: "create" | "update" | "cancel" | "undo";
+  lang?: "en" | "pl";
   title: string;
   from?: string;
   to?: string;
@@ -21,4 +22,9 @@ export type Bubble = {
   pending?: PendingAction;
   decision?: "approved" | "rejected" | "failed";
   done?: boolean; // a change was applied
+  retryText?: string; // on an error: the message to send again with the Retry button
+  usage?: { calls: number; inputTokens: number; outputTokens: number; costUsd: number | null; model: string };
 };
+
+/** Live status lines streamed while the assistant works. */
+export type Progress = { label: string };

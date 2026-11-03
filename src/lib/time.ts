@@ -1,4 +1,5 @@
 import { DateTime } from "luxon";
+import type { Lang } from "./lang.ts";
 
 // All dates the AI and the UI see are local salon time, e.g. "2026-11-02 14:00".
 // Postgres stores real timestamps (timestamptz); conversion happens only here.
@@ -25,15 +26,21 @@ export function formatHuman(date: Date): string {
   return DateTime.fromJSDate(date).setZone(TIMEZONE).toFormat("ccc d LLL, HH:mm");
 }
 
-/** Date -> "Mon 2 Nov (tomorrow)" so it's obvious which day is meant. */
-export function formatDay(date: Date): string {
-  const day = DateTime.fromJSDate(date).setZone(TIMEZONE);
-  return `${day.toFormat("ccc d LLL")} (${relativeDay(day)})`;
+/** Date -> "Mon 2 Nov (tomorrow)" / "pon 2 lis (jutro)" so it's obvious which day is meant. */
+export function formatDay(date: Date, lang: Lang = "en"): string {
+  const day = DateTime.fromJSDate(date).setZone(TIMEZONE).setLocale(lang === "pl" ? "pl" : "en-GB");
+  return `${day.toFormat("ccc d LLL")} (${relativeDay(day, lang)})`;
 }
 
-/** "today", "tomorrow", "yesterday", "in 3 days", "2 days ago" — in salon time. */
-export function relativeDay(day: DateTime): string {
+/** "today", "tomorrow", "in 3 days"… (or Polish) — in salon time. */
+export function relativeDay(day: DateTime, lang: Lang = "en"): string {
   const diff = Math.round(day.startOf("day").diff(now().startOf("day"), "days").days);
+  if (lang === "pl") {
+    if (diff === 0) return "dzisiaj";
+    if (diff === 1) return "jutro";
+    if (diff === -1) return "wczoraj";
+    return diff > 0 ? `za ${diff} dni` : `${-diff} dni temu`;
+  }
   if (diff === 0) return "today";
   if (diff === 1) return "tomorrow";
   if (diff === -1) return "yesterday";

@@ -16,6 +16,7 @@ import {
   updateBooking,
 } from "../bookings.ts";
 import type { PendingDetails } from "../chat-types.ts";
+import type { Lang } from "../lang.ts";
 import { formatDay, formatLocal, parseLocal } from "../time.ts";
 
 export type ToolDef = {
@@ -116,7 +117,7 @@ export const TOOLS: ToolDef[] = [
 export const findTool = (name: string) => TOOLS.find((t) => t.name === name);
 
 type Args = Record<string, unknown>;
-type Ctx = { userId: number };
+type Ctx = { userId: number; lang?: Lang };
 type WriteCtx = Ctx & { source: "ai" | "undo-button" };
 
 const str = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
@@ -154,34 +155,67 @@ export async function runReadTool(name: string, args: Args, ctx: Ctx): Promise<u
   throw new BookingError(`Unknown tool ${name}.`);
 }
 
-/** Checks a write without performing it; returns the text for the approval card. */
+/** Text our own code shows the user (approval cards, confirmations), in the conversation's language. */
+const TEXT = {
+  en: {
+    newBooking: "New booking",
+    change: (id: number) => `Change booking #${id}`,
+    cancel: (id: number) => `Cancel booking #${id}`,
+    undo: (id: number) => `Undo last change to booking #${id}`,
+    cancelled: "Cancelled: ",
+    booked: (d: string, id: number) => `Done — booked ${d} (booking #${id}).`,
+    updated: (id: number, d: string) => `Done — booking #${id} is now ${d}.`,
+    cancelledDone: (id: number, d: string) => `Done — cancelled booking #${id} (${d}). The time slot is free again.`,
+    undoCreated: (id: number, name: string) => `Done — undone: the new booking #${id} for ${name} is cancelled again.`,
+    undoRestored: (id: number, d: string) => `Done — undone: booking #${id} is restored (${d}).`,
+    undoBack: (id: number, d: string) => `Done — undone: booking #${id} is back to ${d}.`,
+  },
+  pl: {
+    newBooking: "Nowa rezerwacja",
+    change: (id: number) => `Zmiana rezerwacji #${id}`,
+    cancel: (id: number) => `Odwołanie rezerwacji #${id}`,
+    undo: (id: number) => `Cofnięcie ostatniej zmiany rezerwacji #${id}`,
+    cancelled: "Odwołana: ",
+    booked: (d: string, id: number) => `Gotowe — zarezerwowano: ${d} (rezerwacja #${id}).`,
+    updated: (id: number, d: string) => `Gotowe — rezerwacja #${id} to teraz: ${d}.`,
+    cancelledDone: (id: number, d: string) => `Gotowe — odwołano rezerwację #${id} (${d}). Termin jest znów wolny.`,
+    undoCreated: (id: number, name: string) => `Gotowe — cofnięto: nowa rezerwacja #${id} (${name}) jest znów odwołana.`,
+    undoRestored: (id: number, d: string) => `Gotowe — cofnięto: przywrócono rezerwację #${id} (${d}).`,
+    undoBack: (id: number, d: string) => `Gotowe — cofnięto: rezerwacja #${id} wróciła do: ${d}.`,
+  },
+} satisfies Record<Lang, unknown>;
+
+/**
+ * Checks a write without performing it; returns the approval card text. `summary` is always
+ * English (logs, tests); `details` is what the user sees, in their language.
+ */
 export async function previewWriteTool(name: string, args: Args, ctx: Ctx): Promise<{ summary: string; details: PendingDetails }> {
+  const lang = ctx.lang ?? "en";
+  const t = TEXT[lang];
+  const d = (b: Parameters<typeof describeBooking>[0], l: Lang = lang) => describeBooking(b, l);
   if (name === "create_booking") {
     const c = await checkCreate(createInput(args, ctx));
-    const to = describeBooking({ clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) });
-    return { summary: `Create booking: ${to}`, details: { kind: "create", title: "New booking", to } };
+    const booking = { clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) };
+    return { summary: `Create booking: ${d(booking, "en")}`, details: { kind: "create", lang, title: t.newBooking, to: d(booking) } };
   }
   if (name === "update_booking") {
     const c = await checkUpdate(updateInput(args, ctx));
-    const from = describeBooking(c.before);
-    const to = describeBooking({ clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) });
-    return { summary: `Change booking #${c.bookingId}: ${from}  →  ${to}`, details: { kind: "update", title: `Change booking #${c.bookingId}`, from, to } };
+    const after = { clientName: c.clientName, service: c.service, start: formatLocal(c.start), end: formatLocal(c.end) };
+    return {
+      summary: `Change booking #${c.bookingId}: ${d(c.before, "en")}  →  ${d(after, "en")}`,
+      details: { kind: "update", lang, title: t.change(c.bookingId), from: d(c.before), to: d(after) },
+    };
   }
   if (name === "cancel_booking") {
     const b = await checkCancel({ userId: ctx.userId, bookingId: args.booking_id });
-    const from = describeBooking(b);
-    return { summary: `Cancel booking #${b.id}: ${from}`, details: { kind: "cancel", title: `Cancel booking #${b.id}`, from } };
+    return { summary: `Cancel booking #${b.id}: ${d(b, "en")}`, details: { kind: "cancel", lang, title: t.cancel(b.id), from: d(b) } };
   }
   if (name === "undo_last_change") {
     const plan = await checkUndo(ctx.userId);
+    const show = (b: typeof plan.restored) => `${b.status === "cancelled" ? t.cancelled : ""}${d(b)}`;
     return {
       summary: `Undo: ${plan.description}`,
-      details: {
-        kind: "undo",
-        title: `Undo last change to booking #${plan.current.id}`,
-        from: plan.current.status === "cancelled" ? `Cancelled: ${describeBooking(plan.current)}` : describeBooking(plan.current),
-        to: plan.restored.status === "cancelled" ? `Cancelled: ${describeBooking(plan.restored)}` : describeBooking(plan.restored),
-      },
+      details: { kind: "undo", lang, title: t.undo(plan.current.id), from: show(plan.current), to: show(plan.restored) },
     };
   }
   throw new BookingError(`Unknown tool ${name}.`);
@@ -190,30 +224,28 @@ export async function previewWriteTool(name: string, args: Args, ctx: Ctx): Prom
 /** Performs an approved write. The same checks run again inside, and an audit row is written. */
 export async function runWriteTool(name: string, args: Args, ctx: WriteCtx): Promise<{ result: unknown; message: string; bookingId: number }> {
   const audit = { approvedBy: ctx.userId, source: ctx.source };
+  const lang = ctx.lang ?? "en";
+  const t = TEXT[lang];
   if (name === "create_booking") {
     const booking = await createBooking(createInput(args, ctx), audit);
-    return { result: { ok: true, booking }, message: `Done — booked ${describeBooking(booking)} (booking #${booking.id}).`, bookingId: booking.id };
+    return { result: { ok: true, booking }, message: t.booked(describeBooking(booking, lang), booking.id), bookingId: booking.id };
   }
   if (name === "update_booking") {
     const { after } = await updateBooking(updateInput(args, ctx), audit);
-    return { result: { ok: true, booking: after }, message: `Done — booking #${after.id} is now ${describeBooking(after)}.`, bookingId: after.id };
+    return { result: { ok: true, booking: after }, message: t.updated(after.id, describeBooking(after, lang)), bookingId: after.id };
   }
   if (name === "cancel_booking") {
     const booking = await cancelBooking({ userId: ctx.userId, bookingId: args.booking_id }, audit);
-    return {
-      result: { ok: true, booking },
-      message: `Done — cancelled booking #${booking.id} (${describeBooking(booking)}). The time slot is free again.`,
-      bookingId: booking.id,
-    };
+    return { result: { ok: true, booking }, message: t.cancelledDone(booking.id, describeBooking(booking, lang)), bookingId: booking.id };
   }
   if (name === "undo_last_change") {
     const { plan, after } = await undoLastChange(ctx.userId, audit);
     const message =
       plan.event.action === "created"
-        ? `Done — undone: the new booking #${after.id} for ${after.clientName} is cancelled again.`
+        ? t.undoCreated(after.id, after.clientName)
         : plan.event.action === "cancelled"
-          ? `Done — undone: booking #${after.id} is restored (${describeBooking(after)}).`
-          : `Done — undone: booking #${after.id} is back to ${describeBooking(after)}.`;
+          ? t.undoRestored(after.id, describeBooking(after, lang))
+          : t.undoBack(after.id, describeBooking(after, lang));
     return { result: { ok: true, undone: plan.description, booking: after }, message, bookingId: after.id };
   }
   throw new BookingError(`Unknown tool ${name}.`);

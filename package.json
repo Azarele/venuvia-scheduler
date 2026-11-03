@@ -11,7 +11,8 @@
     "db:setup": "node --env-file-if-exists=.env.local scripts/db-setup.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings --test \"test/**/*.test.ts\"",
-    "eval": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings scripts/eval.ts"
+    "eval": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings scripts/eval.ts",
+    "test:ui": "node --env-file-if-exists=.env.local --experimental-strip-types --no-warnings --test \"test-ui/**/*.test.ts\""
   },
   "engines": {
     "node": ">=22.9"
@@ -30,6 +31,7 @@
     "@types/pg": "^8.23.1",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "playwright": "^1.63.0",
     "typescript": "^5.9.3"
   }
 }

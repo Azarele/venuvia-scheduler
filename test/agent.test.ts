@@ -263,3 +263,84 @@ test("undo is refused if the booking was changed by something else since", async
   assert.equal(res.pending, null);
   assert.match(res.bubbles.at(-1)!.text, /has changed since then/);
 });
+
+// ---------- Opening hours ----------
+
+test("bookings must fit within opening hours; the error suggests free times", async () => {
+  const late = await runAgent({ userId: EWA, text: "book Ola at 8pm", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 20:00` }), text("Closed then.")]) });
+  assert.equal(late.pending, null);
+  assert.match(late.events[0].error ?? "", /outside opening hours \(09:00–19:00\)\. Nearest free times that day: /);
+  const early = await runAgent({ userId: EWA, text: "move Julia to 8am", provider: fakeProvider([toolCall("update_booking", { booking_id: 3, start: `${tomorrow()} 08:00` }), text("Too early.")]) });
+  assert.match(early.events[0].error ?? "", /outside opening hours/);
+  const overrun = await runAgent({ userId: EWA, text: "book Ola 6:30pm", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 18:30` }), text("Runs past closing.")]) });
+  assert.match(overrun.events[0].error ?? "", /outside opening hours/, "18:30–19:30 ends after closing");
+});
+
+// ---------- Two tabs at once ----------
+
+test("two requests at the same time don't overwrite each other's chat (per-user lock)", async () => {
+  const slow = (reply: string): Provider => ({
+    name: "slow",
+    model: "slow",
+    async complete() {
+      await new Promise((r) => setTimeout(r, 150));
+      return text(reply);
+    },
+  });
+  await Promise.all([
+    runAgent({ userId: EWA, text: "first tab", provider: slow("reply one") }),
+    runAgent({ userId: EWA, text: "second tab", provider: slow("reply two") }),
+  ]);
+  const texts = (await loadConversation(EWA)).bubbles.map((b) => b.text);
+  assert.ok(texts.includes("first tab") && texts.includes("second tab"), `both messages kept: ${JSON.stringify(texts)}`);
+  assert.ok(texts.includes("reply one") && texts.includes("reply two"));
+});
+
+// ---------- Retry, usage, progress, Polish ----------
+
+test("an AI error leaves a Retry-able message; retrying replaces it instead of duplicating", async () => {
+  const { ProviderError } = await import("../src/lib/ai/providers.ts");
+  const failing: Provider = { name: "x", model: "x", complete: async () => { throw new ProviderError("Gemini didn't respond within 60s."); } };
+  await assert.rejects(runAgent({ userId: EWA, text: "Get all bookings", provider: failing }));
+  let bubbles = (await loadConversation(EWA)).bubbles;
+  assert.equal(bubbles.at(-1)?.role, "error");
+  assert.equal(bubbles.at(-1)?.retryText, "Get all bookings");
+
+  await runAgent({ userId: EWA, text: "Get all bookings", retry: true, provider: fakeProvider([text("Here they are.")]) });
+  bubbles = (await loadConversation(EWA)).bubbles;
+  assert.deepEqual(bubbles.map((b) => `${b.role}: ${b.text}`), ["user: Get all bookings", "assistant: Here they are."]);
+});
+
+test("token usage is summed per message and priced for known models", async () => {
+  const withUsage = (m: AssistantMessage, inputTokens: number, outputTokens: number) => ({ ...m, usage: { inputTokens, outputTokens } });
+  const provider = fakeProvider([withUsage(toolCall("get_bookings", {}), 1000, 50), withUsage(text("Done."), 1200, 100)]);
+  provider.model = "claude-haiku-5-5";
+  const res = await runAgent({ userId: EWA, text: "bookings?", provider });
+  assert.deepEqual({ ...res.usage, costUsd: Number(res.usage!.costUsd!.toFixed(6)) }, {
+    calls: 2, inputTokens: 2200, outputTokens: 150, model: "claude-haiku-5-5", costUsd: Number(((2200 * 0.1 + 150 * 0.5) / 1e6).toFixed(6)),
+  });
+  const saved = (await loadConversation(EWA)).bubbles.at(-1);
+  assert.equal(saved?.usage?.calls, 2);
+  assert.ok(!(await loadConversation(EWA)).history.some((m) => "usage" in m), "usage isn't stored in the AI transcript");
+});
+
+test("live progress is reported while the assistant works", async () => {
+  const labels: string[] = [];
+  await runAgent({ userId: EWA, text: "bookings?", provider: fakeProvider([toolCall("get_bookings", {}), text("ok")]), onProgress: (p) => labels.push(p.label) });
+  assert.deepEqual(labels, ["Thinking…", "Looking up your bookings…", "Thinking…"]);
+});
+
+test("Polish: approval card and confirmation are in Polish when the user writes Polish", async () => {
+  const res = await runAgent({ userId: EWA, text: "Zarezerwuj Olę jutro na 14:00", provider: fakeProvider([toolCall("create_booking", { client_name: "Ola", start: `${tomorrow()} 14:00` })]) });
+  assert.equal(res.pending!.details.lang, "pl");
+  assert.equal(res.pending!.details.title, "Nowa rezerwacja");
+  assert.match(res.pending!.details.to!, /Ola, \S+ \d+ \S+ \(jutro\), 14:00–15:00/);
+  assert.match(res.pending!.summary, /^Create booking: Ola/, "the internal summary stays English");
+  const done = await resolvePending({ userId: EWA, pendingId: res.pending!.id, approved: true });
+  assert.match(done.reply ?? "", /^Gotowe — zarezerwowano: Ola/);
+
+  const rejected = await runAgent({ userId: EWA, text: "Przełóż Olę na 16:00", provider: fakeProvider([toolCall("update_booking", { booking_id: 5, start: `${tomorrow()} 16:00` })]) });
+  assert.equal(rejected.pending!.details.title, "Zmiana rezerwacji #5");
+  const no = await resolvePending({ userId: EWA, pendingId: rejected.pending!.id, approved: false });
+  assert.equal(no.reply, "W porządku — niczego nie zmieniłem.");
+});

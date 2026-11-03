@@ -5,7 +5,7 @@ import type { Booking, BookingEvent, Client, User } from "@/lib/bookings.ts";
 import type { Bubble, PendingAction } from "@/lib/chat-types.ts";
 import { Chat } from "./components/Chat.tsx";
 import { SidePanel } from "./components/SidePanel.tsx";
-import { api } from "./ui.ts";
+import { api, streamChat } from "./ui.ts";
 
 type Info = {
   users: User[];
@@ -26,6 +26,7 @@ export default function Home() {
   const [events, setEvents] = useState<BookingEvent[]>([]);
   const [highlight, setHighlight] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
 
   const user = info?.users.find((u) => u.id === userId);
 
@@ -74,12 +75,17 @@ export default function Home() {
       setBubbles(saved?.bubbles.length ? saved.bubbles : (b) => [...b, { id: crypto.randomUUID(), role: "error", text: (e as Error).message, at: new Date().toISOString() }]);
     } finally {
       setBusy(false);
+      setProgress(null);
       refresh(userId).catch(() => {});
     }
   }
 
   const send = (text: string) =>
-    run(() => api<AgentResponse>("/api/chat", { body: { userId, text } }), { id: crypto.randomUUID(), role: "user", text, at: new Date().toISOString() });
+    run(() => streamChat<AgentResponse>({ userId, text }, setProgress), { id: crypto.randomUUID(), role: "user", text, at: new Date().toISOString() });
+  const retry = (text: string) => {
+    setBubbles((b) => (b.at(-1)?.role === "error" ? b.slice(0, -1) : b)); // the server replaces the failed attempt
+    return run(() => streamChat<AgentResponse>({ userId, text, retry: true }, setProgress));
+  };
   const decide = (pending: PendingAction, approved: boolean) => {
     setBubbles((b) => b.map((x) => (x.pending?.id === pending.id ? { ...x, decision: approved ? "approved" : "rejected" } : x)));
     return run(() => api<AgentResponse>("/api/approve", { body: { userId, pendingId: pending.id, approved } }));
@@ -128,7 +134,7 @@ export default function Home() {
       {aiError && <div className="banner">{aiError}</div>}
 
       <main className="layout">
-        <Chat userName={user?.name ?? ""} timezone={info?.timezone ?? ""} bubbles={bubbles} busy={busy} onSend={send} onDecide={decide} />
+        <Chat userName={user?.name ?? ""} timezone={info?.timezone ?? ""} bubbles={bubbles} busy={busy} progress={progress} onSend={send} onRetry={retry} onDecide={decide} />
         <SidePanel
           today={info?.today ?? ""}
           hours={info?.hours ?? { open: "09:00", close: "19:00" }}
