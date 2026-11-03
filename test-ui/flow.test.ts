@@ -128,6 +128,18 @@ test("create → change → cancel → undo → retry → reload, all through th
   // Phone width: everything fits without sideways scrolling.
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(300);
-  const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
-  assert.ok(overflow <= 0, `page scrolls sideways by ${overflow}px on a phone`);
+  const { overflow, culprits } = await page.evaluate(() => {
+    const vw = window.innerWidth;
+    // Elements sticking out past the screen edge, ignoring ones inside their own scrolling area.
+    const scrollsItself = (el: Element) => {
+      for (let p = el.parentElement; p; p = p.parentElement) if (["auto", "scroll", "hidden"].includes(getComputedStyle(p).overflowX)) return true;
+      return false;
+    };
+    const culprits = [...document.querySelectorAll("body *")]
+      .filter((el) => el.getBoundingClientRect().right > vw + 0.5 && !scrollsItself(el))
+      .slice(0, 5)
+      .map((el) => `<${el.tagName.toLowerCase()} class="${el.className}"> "${(el.textContent ?? "").trim().slice(0, 30)}"`);
+    return { overflow: document.documentElement.scrollWidth - vw, culprits };
+  });
+  assert.ok(overflow <= 0, `page scrolls sideways by ${overflow}px on a phone. Too wide: ${culprits.join(", ")}`);
 });

@@ -184,7 +184,7 @@ button:disabled { cursor: default; opacity: 0.5; }
 .approval-actions .danger { background: var(--danger); color: #fff; border-color: var(--danger); }
 
 /* ---------- Side panel ---------- */
-.tabs { display: flex; gap: 4px; padding: 10px 10px 0; border-bottom: 1px solid var(--line); }
+.tabs { display: flex; gap: 4px; padding: 10px 10px 0; border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
 .tabs button {
   border: 0; background: transparent; padding: 9px 14px; border-radius: 10px 10px 0 0; color: var(--muted); font-weight: 600;
   border-bottom: 2px solid transparent; display: inline-flex; align-items: center; gap: 7px;
@@ -245,6 +245,8 @@ ol.activity { list-style: none; margin: 8px 0 0; padding: 0 0 0 10px; border-lef
   .badge { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .approval { min-width: 0; }
   .booking { gap: 10px; }
+  .tabs { gap: 0; padding: 6px 6px 0; }
+  .tabs button { flex: 1 1 0; min-width: 0; justify-content: center; padding: 9px 6px; }
   .chat { height: 75vh; }
   .side { max-height: 80vh; }
   .topbar { padding: 12px 16px; }
