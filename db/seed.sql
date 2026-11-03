@@ -1,6 +1,6 @@
--- Demo data. Bookings are created relative to "tomorrow" in the salon's timezone,
--- so the demo always has something to show.
-set time zone 'Europe/Warsaw';
+-- Demo data. Bookings are created relative to "tomorrow" in the salon's timezone
+-- (BUSINESS_TIMEZONE), so the demo always has something to show. The loader runs
+-- "set time zone '<BUSINESS_TIMEZONE>'" first, so 10:00 here means 10:00 in the app.
 
 insert into users (name) values ('Ewa'), ('Kasia');
 

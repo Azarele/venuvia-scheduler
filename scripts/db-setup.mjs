@@ -8,10 +8,13 @@ const client = new pg.Client({ connectionString: url });
 
 try {
   await client.connect();
-  for (const file of ["db/schema.sql", "db/seed.sql"]) {
-    await client.query(await readFile(file, "utf8"));
-    console.log(`✓ ran ${file}`);
-  }
+  // Seed times ("10:00 tomorrow") are in the salon's timezone, the same one the app uses.
+  const timezone = process.env.BUSINESS_TIMEZONE ?? "Europe/Warsaw";
+  if (!/^[A-Za-z0-9_/+-]+$/.test(timezone)) throw new Error(`BUSINESS_TIMEZONE "${timezone}" doesn't look like a timezone name.`);
+  await client.query(await readFile("db/schema.sql", "utf8"));
+  console.log("✓ ran db/schema.sql");
+  await client.query(`set time zone '${timezone}';\n${await readFile("db/seed.sql", "utf8")}`);
+  console.log(`✓ ran db/seed.sql (times in ${timezone})`);
   const { rows } = await client.query(
     "select (select count(*) from users) users, (select count(*) from clients) clients, (select count(*) from bookings) bookings",
   );

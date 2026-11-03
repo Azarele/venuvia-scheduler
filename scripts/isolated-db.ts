@@ -25,5 +25,8 @@ export async function useIsolatedDatabase(suffix: "test" | "eval"): Promise<stri
 export async function resetDatabase(db: { query: (sql: string) => Promise<{ rows: { name: string }[] }> }): Promise<void> {
   const { rows } = await db.query("select current_database() as name");
   if (!/_(test|eval)$/.test(rows[0].name)) throw new Error(`Refusing to reset "${rows[0].name}": tests and evals only reset *_test / *_eval databases.`);
-  for (const file of ["db/schema.sql", "db/seed.sql"]) await db.query(await readFile(file, "utf8"));
+  await db.query(await readFile("db/schema.sql", "utf8"));
+  // One multi-statement query runs on one connection, so the time zone applies to the seed.
+  const timezone = (process.env.BUSINESS_TIMEZONE ?? "Europe/Warsaw").replace(/[^A-Za-z0-9_/+-]/g, "");
+  await db.query(`set time zone '${timezone}';\n${await readFile("db/seed.sql", "utf8")}`);
 }
