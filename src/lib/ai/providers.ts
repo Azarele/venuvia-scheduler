@@ -67,24 +67,52 @@ function required(value: string | undefined, name: string, where: string): strin
 
 // ---------- Gemini / OpenRouter (OpenAI-compatible chat completions) ----------
 
-function openAICompatible(opts: { name: string; baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> }): Provider {
+/** How long one AI request may take before we give up (AI_TIMEOUT_MS, default 60s). */
+const timeoutMs = () => Number(process.env.AI_TIMEOUT_MS) || 60_000;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function openAICompatible(opts: { name: string; baseUrl: string; apiKey: string; model: string; headers?: Record<string, string> }): Provider {
+  /** One HTTP request with a timeout; retried once if the AI is overloaded (503) or rate-limited (429). */
+  async function post(body: string): Promise<Response> {
+    for (let attempt = 1; ; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(`${opts.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${opts.apiKey}`, ...opts.headers },
+          body,
+          signal: AbortSignal.timeout(timeoutMs()),
+        });
+      } catch (error) {
+        const name = (error as Error).name;
+        if (name === "TimeoutError" || name === "AbortError")
+          throw new ProviderError(`${opts.name} didn't respond within ${timeoutMs() / 1000}s. It may be overloaded — try again in a moment.`);
+        throw new ProviderError(`Couldn't reach ${opts.name}: ${(error as Error).message}`);
+      }
+      if ((res.status === 503 || res.status === 429) && attempt === 1) {
+        await sleep(res.status === 429 ? 10_000 : 2_000);
+        continue;
+      }
+      return res;
+    }
+  }
+
   return {
     name: opts.name,
     model: opts.model,
     async complete({ system, messages, tools }) {
-      const res = await fetch(`${opts.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${opts.apiKey}`, ...opts.headers },
-        body: JSON.stringify({
+      const res = await post(
+        JSON.stringify({
           model: opts.model,
           messages: [{ role: "system", content: system }, ...messages.map(withoutPrivateFields)],
           tools: tools.map((t) => ({ type: "function", function: { name: t.name, description: t.description, parameters: t.parameters } })),
           tool_choice: "auto",
         }),
-      });
+      );
       if (!res.ok) {
         const body = (await res.text()).slice(0, 400);
-        const hint = res.status === 429 ? " (free-tier rate limit — wait a minute and try again)" : "";
+        const hint =
+          res.status === 429 ? " (free-tier rate limit — wait a minute and try again)" : res.status === 503 ? " (the model is overloaded — try again shortly)" : "";
         throw new ProviderError(`${opts.name} returned HTTP ${res.status}${hint}: ${body}`);
       }
       const data = await res.json();
@@ -109,7 +137,8 @@ function withoutPrivateFields(message: ChatMessage) {
 // ---------- Claude (production) ----------
 
 function anthropic(opts: { apiKey: string; model: string }): Provider {
-  const client = new Anthropic({ apiKey: opts.apiKey });
+  // The SDK retries 429/5xx itself (2 retries by default); the timeout bounds each attempt.
+  const client = new Anthropic({ apiKey: opts.apiKey, timeout: timeoutMs() });
   return {
     name: "Claude",
     model: opts.model,

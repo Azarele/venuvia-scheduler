@@ -137,7 +137,7 @@ Eval: Gemini · gemini-flash-latest · 18 cases
 N/18 passed · avg X.Xs per message
 ```
 
-Run it with each model you're considering (`AI_PROVIDER` / `*_MODEL`) to pick the cheapest one that passes. `npm run eval -- julia` runs only matching cases, and `EVAL_DELAY_MS` spaces requests out for free-tier rate limits (default 4s).
+Run it with each model you're considering (`AI_PROVIDER` / `*_MODEL`) to pick the cheapest one that passes. `npm run eval -- julia` runs only matching cases, and `EVAL_DELAY_MS` spaces requests out for free-tier rate limits (default 4s). Each AI step is printed as it happens. A request that gets no answer within `AI_TIMEOUT_MS` (default 60s) fails with a clear message instead of hanging, and an overloaded (503) or rate-limited (429) response is retried once.
 
 ## Project structure
 

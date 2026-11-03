@@ -80,11 +80,28 @@ const CASES: Case[] = [
 const filter = process.argv.slice(2).join(" ").toLowerCase();
 const cases = CASES.filter((c) => !filter || c.say.toLowerCase().includes(filter));
 const delayMs = Number(process.env.EVAL_DELAY_MS ?? 4000); // free tiers allow only a few requests per minute
-const provider = getProvider();
+const baseProvider = getProvider();
+// Wraps the provider to print each AI step live, so a slow or stuck request is visible.
+const provider = {
+  ...baseProvider,
+  async complete(request: Parameters<typeof baseProvider.complete>[0]) {
+    const started = Date.now();
+    process.stdout.write(`      · asking ${baseProvider.name}… `);
+    try {
+      const reply = await baseProvider.complete(request);
+      const calls = reply.tool_calls?.map((c) => c.function.name).join(", ");
+      process.stdout.write(`${calls ? `→ ${calls}` : "→ text reply"} (${((Date.now() - started) / 1000).toFixed(1)}s)\n`);
+      return reply;
+    } catch (error) {
+      process.stdout.write(`failed after ${((Date.now() - started) / 1000).toFixed(1)}s\n`);
+      throw error;
+    }
+  },
+};
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 await resetDatabase(pool);
-console.log(`\nEval: ${provider.name} · ${provider.model} · ${cases.length} cases · today is ${now().toFormat("ccc yyyy-MM-dd")}\n`);
+console.log(`\nEval: ${provider.name} · ${provider.model} · ${cases.length} cases · timeout ${(Number(process.env.AI_TIMEOUT_MS) || 60_000) / 1000}s per AI request · today is ${now().toFormat("ccc yyyy-MM-dd")}\n`);
 
 let passed = 0;
 let totalMs = 0;
@@ -92,6 +109,7 @@ const failures: string[] = [];
 for (const [i, c] of cases.entries()) {
   if (i > 0) await sleep(delayMs);
   await clearConversation(USER);
+  console.log(`${String(i + 1).padStart(2)}/${cases.length}  ${c.say}`);
   const started = Date.now();
   let outcome: Outcome;
   try {
@@ -99,8 +117,8 @@ for (const [i, c] of cases.entries()) {
     try {
       res = await runAgent({ userId: USER, text: c.say, provider });
     } catch (error) {
-      if (!(error instanceof ProviderError) || !/429/.test(error.message)) throw error;
-      console.log("   (rate limited — waiting 30s and retrying)");
+      if (!(error instanceof ProviderError) || !/429|503|didn't respond/.test(error.message)) throw error;
+      console.log(`      (${error.message.slice(0, 80)} — waiting 30s and retrying once)`);
       await sleep(30_000);
       await clearConversation(USER);
       res = await runAgent({ userId: USER, text: c.say, provider });
@@ -123,9 +141,9 @@ for (const [i, c] of cases.entries()) {
   const did = outcome.write
     ? `${outcome.write.tool} ${JSON.stringify(outcome.write.args)}${outcome.write.error ? ` → refused: ${outcome.write.error.slice(0, 60)}` : ""}`
     : `${outcome.reads.join(", ") || "no tools"} → "${outcome.reply.replace(/\s+/g, " ").slice(0, 80)}"`;
-  console.log(`${ok ? "✓" : "✗"} ${String(i + 1).padStart(2)}. ${c.say}  (${(ms / 1000).toFixed(1)}s)`);
+  console.log(`      ${ok ? "✓ pass" : "✗ FAIL"} (${(ms / 1000).toFixed(1)}s)`);
   if (!ok) {
-    console.log(`      expected: ${c.expect}\n      got:      ${did}`);
+    console.log(`        expected: ${c.expect}\n        got:      ${did}`);
     failures.push(c.say);
   }
 }
